@@ -28,7 +28,8 @@ impl PositionEvent {
                 "<event version=\"2.0\" uid=\"{}\" type=\"a-f-G-U-C\" ",
                 "time=\"{}\" start=\"{}\" stale=\"{}\" how=\"m-g\">",
                 "<point lat=\"{}\" lon=\"{}\" hae=\"{}\" ce=\"9999999\" le=\"9999999\"/>",
-                "<detail><contact callsign=\"{}\"/><track course=\"{}\" speed=\"{}\"/>",
+                "<detail><contact callsign=\"{}\"/><takv device=\"tak_bench\" os=\"Linux\" ",
+                "platform=\"tak_bench\" version=\"0.1.0\"/><track course=\"{}\" speed=\"{}\"/>",
                 "<tak_bench correlation_id=\"{}\"/></detail></event>"
             ),
             escape(&self.uid),
