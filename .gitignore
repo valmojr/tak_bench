@@ -1,5 +1,6 @@
 /target/
 /results/
+/.workbench/
 *.pem
 *.key
 !examples/*.pem
