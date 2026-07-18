@@ -1,0 +1,19 @@
+version: 1
+authorization:
+  acknowledged: true
+environment: local
+allow_hosts:
+  - 127.0.0.1
+target:
+  server: 127.0.0.1:8089
+run:
+  profile: functional
+  clients: 2
+  max_clients: 10
+  duration: 1m
+  gps_interval: 5s
+scenario:
+  kind: position
+  movement: fixed
+output:
+  json: results/functional.json

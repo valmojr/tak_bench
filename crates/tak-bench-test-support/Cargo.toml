@@ -1,0 +1,13 @@
+[package]
+name = "tak-bench-test-support"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+tak-bench-core = { path = "../tak-bench-core" }
+
+[lints]
+workspace = true

@@ -1,0 +1,42 @@
+[workspace]
+members = [
+    "crates/tak-bench-cli",
+    "crates/tak-bench-core",
+    "crates/tak-bench-protocol",
+    "crates/tak-bench-scenarios",
+    "crates/tak-bench-report",
+    "crates/tak-bench-test-support",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+hdrhistogram = "7.5"
+quick-xml = "0.38"
+rand = "0.9"
+rustls = "0.23"
+rustls-pemfile = "2.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+thiserror = "2.0"
+time = { version = "0.3", features = ["serde-human-readable"] }
+tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
+tokio-rustls = "0.26"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1.12", features = ["v4", "serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
