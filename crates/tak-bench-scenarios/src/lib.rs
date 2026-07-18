@@ -152,6 +152,10 @@ async fn send_positions(
 ) -> Result<()> {
     let mut ticker = interval(config.run.gps_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Tokio intervals tick immediately. Delay the first position so servers
+    // which establish their per-client routing state asynchronously can finish
+    // registering the connection before the initial CoT event arrives.
+    ticker.tick().await;
     loop {
         tokio::select! {
             _ = ticker.tick() => {
