@@ -1,6 +1,6 @@
-# tak_bench
+# TAK Bench
 
-`tak_bench` is a Rust tool for explicitly authorized testing of TAK/CoT servers that accept CoT XML over raw TCP, TLS, or mTLS. Its stream framing follows the official TAK Server `StreamingCotProtocol`: fragmented and concatenated CoT events, as well as authentication preambles, are supported.
+`TAK Bench` is a Rust tool for explicitly authorized testing of TAK/CoT servers that accept CoT XML over raw TCP, TLS, or mTLS. Its stream framing follows the official TAK Server `StreamingCotProtocol`: fragmented and concatenated CoT events, as well as authentication preambles, are supported.
 
 > Use this tool only against servers you administer or are authorized to test.
 
