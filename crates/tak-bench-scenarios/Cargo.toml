@@ -15,5 +15,10 @@ tak-bench-core = { path = "../tak-bench-core" }
 tak-bench-protocol = { path = "../tak-bench-protocol" }
 tokio.workspace = true
 
+[dev-dependencies]
+rcgen = "0.13"
+rustls.workspace = true
+tokio-rustls.workspace = true
+
 [lints]
 workspace = true

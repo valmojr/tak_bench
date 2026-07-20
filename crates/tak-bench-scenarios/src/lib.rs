@@ -454,6 +454,12 @@ pub fn minimum_stale_interval(interval: std::time::Duration) -> std::time::Durat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+    use rustls::{
+        RootCertStore, ServerConfig,
+        pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
+        server::WebPkiClientVerifier,
+    };
     use std::sync::atomic::AtomicUsize;
     use tak_bench_core::config::{ReconnectConfig, RoutingAssertion};
     use tokio::{
@@ -520,6 +526,209 @@ mod tests {
                 }
             });
         }
+    }
+
+    #[tokio::test]
+    async fn tls_hostname_validation_uses_an_ephemeral_local_ca() {
+        let mut ca_params = CertificateParams::new(vec!["test-ca".into()]).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_key = KeyPair::generate().unwrap();
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let server_key = KeyPair::generate().unwrap();
+        let server = CertificateParams::new(vec!["example.test".into()])
+            .unwrap()
+            .signed_by(&server_key, &ca, &ca_key)
+            .unwrap();
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![server.der().clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der())),
+            )
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let task = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            acceptor.accept(tcp).await.unwrap();
+        });
+        let path = std::env::temp_dir().join(format!("tak-bench-test-{}.pem", Uuid::new_v4()));
+        std::fs::write(&path, ca.pem()).unwrap();
+        let target = tak_bench_core::config::TargetConfig {
+            server: address.to_string(),
+            sni: Some("example.test".into()),
+        };
+        let tls = tak_bench_core::config::TlsConfig {
+            enabled: true,
+            ca: Some(path.clone()),
+            ..tak_bench_core::config::TlsConfig::default()
+        };
+        assert!(
+            connection::connect(
+                &target,
+                &tls,
+                &tak_bench_core::config::TimeoutConfig::default()
+            )
+            .await
+            .is_ok()
+        );
+        let _ = std::fs::remove_file(path);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tls_rejects_an_incorrect_sni() {
+        let mut ca_params = CertificateParams::new(vec!["test-ca".into()]).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_key = KeyPair::generate().unwrap();
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let key = KeyPair::generate().unwrap();
+        let cert = CertificateParams::new(vec!["example.test".into()])
+            .unwrap()
+            .signed_by(&key, &ca, &ca_key)
+            .unwrap();
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+            )
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let task = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let _ = acceptor.accept(tcp).await;
+        });
+        let path = std::env::temp_dir().join(format!("tak-bench-test-{}.pem", Uuid::new_v4()));
+        std::fs::write(&path, ca.pem()).unwrap();
+        let tls = tak_bench_core::config::TlsConfig {
+            enabled: true,
+            ca: Some(path.clone()),
+            ..tak_bench_core::config::TlsConfig::default()
+        };
+        assert!(
+            connection::connect(
+                &tak_bench_core::config::TargetConfig {
+                    server: address.to_string(),
+                    sni: Some("wrong.test".into())
+                },
+                &tls,
+                &tak_bench_core::config::TimeoutConfig::default()
+            )
+            .await
+            .is_err()
+        );
+        let _ = std::fs::remove_file(path);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tls_handshake_timeout_is_bounded() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (_tcp, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+        let mut params = CertificateParams::new(vec!["test-ca".into()]).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let key = KeyPair::generate().unwrap();
+        let ca = params.self_signed(&key).unwrap();
+        let path = std::env::temp_dir().join(format!("tak-bench-test-{}.pem", Uuid::new_v4()));
+        std::fs::write(&path, ca.pem()).unwrap();
+        let tls = tak_bench_core::config::TlsConfig {
+            enabled: true,
+            ca: Some(path.clone()),
+            ..tak_bench_core::config::TlsConfig::default()
+        };
+        let timeouts = tak_bench_core::config::TimeoutConfig {
+            tls_handshake: std::time::Duration::from_millis(10),
+            ..tak_bench_core::config::TimeoutConfig::default()
+        };
+        assert!(
+            connection::connect(
+                &tak_bench_core::config::TargetConfig {
+                    server: address.to_string(),
+                    sni: Some("example.test".into())
+                },
+                &tls,
+                &timeouts
+            )
+            .await
+            .is_err()
+        );
+        let _ = std::fs::remove_file(path);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mtls_requires_and_accepts_an_ephemeral_client_certificate() {
+        let mut params = CertificateParams::new(vec!["test-ca".into()]).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_key = KeyPair::generate().unwrap();
+        let ca = params.self_signed(&ca_key).unwrap();
+        let server_key = KeyPair::generate().unwrap();
+        let server = CertificateParams::new(vec!["example.test".into()])
+            .unwrap()
+            .signed_by(&server_key, &ca, &ca_key)
+            .unwrap();
+        let client_key = KeyPair::generate().unwrap();
+        let client = CertificateParams::new(vec!["client.test".into()])
+            .unwrap()
+            .signed_by(&client_key, &ca, &ca_key)
+            .unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(ca.der().clone()).unwrap();
+        let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .unwrap();
+        let config = ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(
+                vec![server.der().clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der())),
+            )
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let task = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            acceptor.accept(tcp).await.unwrap();
+        });
+        let base = std::env::temp_dir().join(format!("tak-bench-test-{}", Uuid::new_v4()));
+        let ca_path = base.with_extension("ca");
+        let cert_path = base.with_extension("cert");
+        let key_path = base.with_extension("key");
+        std::fs::write(&ca_path, ca.pem()).unwrap();
+        std::fs::write(&cert_path, client.pem()).unwrap();
+        std::fs::write(&key_path, client_key.serialize_pem()).unwrap();
+        let tls = tak_bench_core::config::TlsConfig {
+            enabled: true,
+            ca: Some(ca_path.clone()),
+            client_cert: Some(cert_path.clone()),
+            client_key: Some(key_path.clone()),
+            ..tak_bench_core::config::TlsConfig::default()
+        };
+        assert!(
+            connection::connect(
+                &tak_bench_core::config::TargetConfig {
+                    server: address.to_string(),
+                    sni: Some("example.test".into())
+                },
+                &tls,
+                &tak_bench_core::config::TimeoutConfig::default()
+            )
+            .await
+            .is_ok()
+        );
+        for path in [ca_path, cert_path, key_path] {
+            let _ = std::fs::remove_file(path);
+        }
+        task.await.unwrap();
     }
 
     #[tokio::test]
