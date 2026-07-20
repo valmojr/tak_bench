@@ -186,13 +186,11 @@ async fn run(args: RunArgs, forced_profile: Option<Profile>) -> Result<()> {
         .as_ref()
         .map_or_else(|| Ok(AppConfig::default()), read_config)?;
     apply_overrides(&mut config, &args, forced_profile)?;
-    safety::validate_with_options(
-        &config,
-        safety::SafetyOptions {
-            allow_production: args.allow_production,
-            allow_invalid_events: args.allow_invalid_events,
-        },
-    )?;
+    let safety_options = safety::SafetyOptions {
+        allow_production: args.allow_production,
+        allow_invalid_events: args.allow_invalid_events,
+    };
+    safety::validate_with_options(&config, safety_options)?;
     println!("{AUTHORIZATION_BANNER}");
     let metrics = Arc::new(Metrics::new());
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
@@ -222,9 +220,13 @@ async fn run(args: RunArgs, forced_profile: Option<Profile>) -> Result<()> {
             }
         }
     });
-    let outcome =
-        tak_bench_scenarios::run_fixed_positions(config.clone(), Arc::clone(&metrics), stop_rx)
-            .await;
+    let outcome = tak_bench_scenarios::run_fixed_positions_with_options(
+        config.clone(),
+        Arc::clone(&metrics),
+        stop_rx,
+        safety_options,
+    )
+    .await;
     monitor.abort();
     let threshold = threshold_reason.lock().await.clone();
     let assertions = outcome

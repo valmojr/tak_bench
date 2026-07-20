@@ -1,6 +1,9 @@
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
-use crate::config::{AppConfig, Environment, Profile, host_from_server, is_loopback};
+use crate::config::{
+    AppConfig, Environment, Movement, ParticipantRole, Profile, ScenarioKind, host_from_server,
+    is_loopback,
+};
 use thiserror::Error;
 
 pub const AUTHORIZATION_BANNER: &str =
@@ -26,6 +29,22 @@ pub enum SafetyError {
     ProductionRate,
     #[error("clients cannot exceed max_clients")]
     ClientLimit,
+    #[error("run.clients must match the number of explicit participants")]
+    ParticipantCountMismatch,
+    #[error("at least one participant is required")]
+    NoParticipants,
+    #[error("participant IDs must be non-empty and unique")]
+    InvalidParticipantId,
+    #[error("routing assertions must reference participants with compatible roles")]
+    InvalidRoutingAssertion,
+    #[error("only fixed position workloads are currently implemented")]
+    UnsupportedWorkload,
+    #[error("the configured option is not implemented by the current runner")]
+    UnsupportedOption,
+    #[error("durations, timeouts, rates, and reconnect bounds must be finite and positive")]
+    InvalidBounds,
+    #[error("stress, spike, soak, and disruptive scenarios are local or temporary only")]
+    EnvironmentProfileNotAllowed,
     #[error(
         "invalid event scenarios require explicit opt-in outside local or temporary environments"
     )]
@@ -72,27 +91,9 @@ pub fn validate_with_options(
     if !local_loopback && !config.allow_hosts.iter().any(|allowed| allowed == host) {
         return Err(SafetyError::HostNotAllowed(host.into()));
     }
-    if config.run.clients > config.run.max_clients {
-        return Err(SafetyError::ClientLimit);
-    }
-    if config.environment == Environment::Production {
-        if !options.allow_production {
-            return Err(SafetyError::ProductionNotAllowed);
-        }
-        if config.run.profile != Profile::Smoke {
-            return Err(SafetyError::ProductionProfile(config.run.profile));
-        }
-        if config.run.clients > 3 || config.run.max_clients > 3 {
-            return Err(SafetyError::ProductionClients);
-        }
-        if config.run.duration > Duration::from_secs(15 * 60) {
-            return Err(SafetyError::ProductionDuration);
-        }
-        if config.run.gps_interval < Duration::from_secs(30)
-            || config.run.max_rate.is_some_and(|rate| rate > 0.1)
-        {
-            return Err(SafetyError::ProductionRate);
-        }
+    validate_workload(config)?;
+    if config.environment == Environment::Production && !options.allow_production {
+        return Err(SafetyError::ProductionNotAllowed);
     }
     if config.scenario.invalid.enabled {
         let environment_permits = matches!(
@@ -103,21 +104,156 @@ pub fn validate_with_options(
         if !environment_permits {
             return Err(SafetyError::InvalidEventsNotAllowed);
         }
-        if config.scenario.invalid.max_events.is_none()
-            || config.run.max_rate.is_some_and(|rate| rate > 1.0)
-            || config.run.gps_interval < Duration::from_secs(1)
+    }
+    Ok(())
+}
+
+/// Validates workload invariants which must hold even for direct library callers.
+///
+/// # Errors
+///
+/// Returns an error for unsupported behavior, invalid bounds, or a workload that exceeds its
+/// declared participant and environment limits.
+pub fn validate_workload(config: &AppConfig) -> Result<(), SafetyError> {
+    let participant_count = if config.participants.is_empty() {
+        config.run.clients
+    } else {
+        let count =
+            u32::try_from(config.participants.len()).map_err(|_| SafetyError::ClientLimit)?;
+        if count != config.run.clients {
+            return Err(SafetyError::ParticipantCountMismatch);
+        }
+        count
+    };
+    if participant_count == 0 {
+        return Err(SafetyError::NoParticipants);
+    }
+    if participant_count > config.run.max_clients {
+        return Err(SafetyError::ClientLimit);
+    }
+    validate_participants_and_routing(config)?;
+
+    let timeouts = &config.timeouts;
+    if config.run.duration.is_zero()
+        || config.run.gps_interval.is_zero()
+        || timeouts.connect.is_zero()
+        || timeouts.tls_handshake.is_zero()
+        || timeouts.read.is_zero()
+        || timeouts.write.is_zero()
+        || config.run.max_rate.is_some_and(|rate| {
+            let interval = 1.0 / rate;
+            !rate.is_finite()
+                || rate <= 0.0
+                || !interval.is_finite()
+                || interval > Duration::MAX.as_secs_f64()
+        })
+        || (config.reconnect.enabled
+            && (config.reconnect.min_backoff.is_zero()
+                || config.reconnect.max_backoff.is_zero()
+                || config.reconnect.min_backoff > config.reconnect.max_backoff))
+    {
+        return Err(SafetyError::InvalidBounds);
+    }
+    if config.scenario.kind != ScenarioKind::Position || config.scenario.movement != Movement::Fixed
+    {
+        return Err(SafetyError::UnsupportedWorkload);
+    }
+    if !config.scheduler.ramp_down.is_zero()
+        || config.tls.client_cert_template.is_some()
+        || config.tls.client_key_template.is_some()
+    {
+        return Err(SafetyError::UnsupportedOption);
+    }
+
+    let disruptive = config.scenario.slow_connect.enabled
+        || config.scenario.abrupt_disconnect.enabled
+        || config.participants.iter().any(|participant| {
+            participant.read_delay.is_some() || participant.pause_read_for.is_some()
+        });
+    let local_or_temporary = matches!(
+        config.environment,
+        Environment::Local | Environment::Temporary
+    );
+    if (!local_or_temporary
+        && matches!(
+            config.run.profile,
+            Profile::Stress | Profile::Spike | Profile::Soak
+        ))
+        || (config.environment == Environment::Staging && disruptive)
+    {
+        return Err(SafetyError::EnvironmentProfileNotAllowed);
+    }
+
+    if config.environment == Environment::Production {
+        if config.run.profile != Profile::Smoke {
+            return Err(SafetyError::ProductionProfile(config.run.profile));
+        }
+        if participant_count > 3 || config.run.max_clients > 3 {
+            return Err(SafetyError::ProductionClients);
+        }
+        if config.run.duration > Duration::from_secs(15 * 60) {
+            return Err(SafetyError::ProductionDuration);
+        }
+        if config.run.gps_interval < Duration::from_secs(30)
+            || config.run.max_rate.is_some_and(|rate| rate > 0.1)
         {
-            return Err(SafetyError::InvalidEventLimit);
+            return Err(SafetyError::ProductionRate);
+        }
+        if disruptive {
+            return Err(SafetyError::SlowClientNotAllowed);
         }
     }
-    if config.environment == Environment::Production
-        && (config.scenario.slow_connect.enabled
-            || config.scenario.abrupt_disconnect.enabled
-            || config.participants.iter().any(|participant| {
-                participant.read_delay.is_some() || participant.pause_read_for.is_some()
-            }))
+    if config.scenario.invalid.enabled
+        && (config
+            .scenario
+            .invalid
+            .max_events
+            .is_none_or(|events| events == 0)
+            || config.run.max_rate.is_some_and(|rate| rate > 1.0)
+            || config.run.gps_interval < Duration::from_secs(1))
     {
-        return Err(SafetyError::SlowClientNotAllowed);
+        return Err(SafetyError::InvalidEventLimit);
+    }
+    Ok(())
+}
+
+fn validate_participants_and_routing(config: &AppConfig) -> Result<(), SafetyError> {
+    if config.participants.is_empty() {
+        return if config.scenario.routing.is_empty() {
+            Ok(())
+        } else {
+            Err(SafetyError::InvalidRoutingAssertion)
+        };
+    }
+    let mut ids = HashSet::with_capacity(config.participants.len());
+    if config
+        .participants
+        .iter()
+        .any(|participant| participant.id.is_empty() || !ids.insert(participant.id.as_str()))
+    {
+        return Err(SafetyError::InvalidParticipantId);
+    }
+    for assertion in &config.scenario.routing {
+        let sender = config
+            .participants
+            .iter()
+            .find(|participant| participant.id == assertion.sender);
+        if sender.is_none_or(|participant| participant.role == ParticipantRole::ReceiveOnly)
+            || assertion.receivers.is_empty() && assertion.forbidden_receivers.is_empty()
+            || assertion
+                .receivers
+                .iter()
+                .chain(&assertion.forbidden_receivers)
+                .any(|id| {
+                    config
+                        .participants
+                        .iter()
+                        .find(|participant| &participant.id == id)
+                        .is_none_or(|participant| participant.role == ParticipantRole::SendOnly)
+                })
+        {
+            return Err(SafetyError::InvalidRoutingAssertion);
+        }
     }
     Ok(())
 }
@@ -254,6 +390,79 @@ mod tests {
                 }
             ),
             Err(SafetyError::SlowClientNotAllowed)
+        );
+    }
+
+    #[test]
+    fn explicit_participants_cannot_bypass_declared_limits() {
+        let participants = (0..4)
+            .map(|index| crate::config::ParticipantConfig {
+                id: format!("participant-{index}"),
+                ..crate::config::ParticipantConfig::default()
+            })
+            .collect();
+        let mismatched = AppConfig {
+            participants,
+            run: crate::config::RunConfig {
+                clients: 1,
+                max_clients: 3,
+                ..crate::config::RunConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            validate_workload(&mismatched),
+            Err(SafetyError::ParticipantCountMismatch)
+        );
+
+        let over_limit = AppConfig {
+            run: crate::config::RunConfig {
+                clients: 4,
+                max_clients: 3,
+                ..crate::config::RunConfig::default()
+            },
+            ..mismatched
+        };
+        assert_eq!(
+            validate_workload(&over_limit),
+            Err(SafetyError::ClientLimit)
+        );
+    }
+
+    #[test]
+    fn participant_ids_routing_and_workload_options_are_validated() {
+        let duplicate = AppConfig {
+            run: crate::config::RunConfig {
+                clients: 2,
+                ..crate::config::RunConfig::default()
+            },
+            participants: vec![
+                crate::config::ParticipantConfig {
+                    id: "duplicate".into(),
+                    ..crate::config::ParticipantConfig::default()
+                },
+                crate::config::ParticipantConfig {
+                    id: "duplicate".into(),
+                    ..crate::config::ParticipantConfig::default()
+                },
+            ],
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            validate_workload(&duplicate),
+            Err(SafetyError::InvalidParticipantId)
+        );
+
+        let unsupported = AppConfig {
+            scenario: crate::config::ScenarioConfig {
+                kind: ScenarioKind::Chat,
+                ..crate::config::ScenarioConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            validate_workload(&unsupported),
+            Err(SafetyError::UnsupportedWorkload)
         );
     }
 }

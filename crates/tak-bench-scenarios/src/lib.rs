@@ -51,6 +51,28 @@ pub async fn run_fixed_positions(
     metrics: Arc<Metrics>,
     stop: watch::Receiver<bool>,
 ) -> Result<ScenarioOutcome> {
+    run_fixed_positions_with_options(
+        config,
+        metrics,
+        stop,
+        tak_bench_core::safety::SafetyOptions::default(),
+    )
+    .await
+}
+
+/// Runs fixed positions after applying the full authorization and environment safety policy.
+///
+/// # Errors
+///
+/// Returns an error for unsafe configuration, failed connection, timeout, invalid schedule, or
+/// exhausted reconnect budget.
+pub async fn run_fixed_positions_with_options(
+    config: AppConfig,
+    metrics: Arc<Metrics>,
+    mut stop: watch::Receiver<bool>,
+    safety_options: tak_bench_core::safety::SafetyOptions,
+) -> Result<ScenarioOutcome> {
+    tak_bench_core::safety::validate_with_options(&config, safety_options)?;
     let deadline = tokio::time::Instant::now() + config.run.duration;
     let participants = participants(&config);
     let delays = start_delays(
@@ -58,23 +80,68 @@ pub async fn run_fixed_positions(
         &config.scheduler,
     )?;
     let ledger = Arc::new(Mutex::new(CorrelationLedger::default()));
-    let mut tasks = Vec::new();
+    let (cancel_tx, cancel) = watch::channel(*stop.borrow());
+    let forward_tx = cancel_tx.clone();
+    let forward_stop = tokio::spawn(async move {
+        wait_for_stop(&mut stop).await;
+        let _ = forward_tx.send(true);
+    });
+    let mut tasks = tokio::task::JoinSet::new();
     for (participant, delay) in participants.into_iter().zip(delays) {
         let config = config.clone();
         let metrics = Arc::clone(&metrics);
         let ledger = Arc::clone(&ledger);
-        let stop = stop.clone();
-        tasks.push(tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
+        let mut stop = cancel.clone();
+        tasks.spawn(async move {
+            if !wait_for_delay(delay, &mut stop, deadline).await {
+                return Ok(());
+            }
             run_participant(participant, config, metrics, ledger, stop, deadline).await
-        }));
+        });
     }
-    for task in tasks {
-        task.await??;
+    let mut first_error = None;
+    while let Some(task) = tasks.join_next().await {
+        let result = task
+            .map_err(|error| anyhow::anyhow!("participant task failed: {error}"))
+            .and_then(std::convert::identity);
+        if first_error.is_none()
+            && let Err(error) = result
+        {
+            first_error = Some(error);
+            let _ = cancel_tx.send(true);
+        }
+    }
+    forward_stop.abort();
+    let _ = forward_stop.await;
+    if let Some(error) = first_error {
+        return Err(error);
     }
     Ok(ScenarioOutcome {
         assertions: evaluate_routing(&config.scenario.routing, &*ledger.lock().await),
     })
+}
+
+async fn wait_for_stop(stop: &mut watch::Receiver<bool>) {
+    loop {
+        if *stop.borrow() || stop.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn wait_for_delay(
+    delay: std::time::Duration,
+    stop: &mut watch::Receiver<bool>,
+    deadline: tokio::time::Instant,
+) -> bool {
+    if *stop.borrow() || tokio::time::Instant::now() >= deadline {
+        return false;
+    }
+    tokio::select! {
+        () = tokio::time::sleep(delay) => true,
+        () = wait_for_stop(stop) => false,
+        () = tokio::time::sleep_until(deadline) => false,
+    }
 }
 
 fn participants(config: &AppConfig) -> Vec<ParticipantConfig> {
@@ -94,14 +161,23 @@ async fn run_participant(
     config: AppConfig,
     metrics: Arc<Metrics>,
     ledger: Arc<Mutex<CorrelationLedger>>,
-    stop: watch::Receiver<bool>,
+    mut stop: watch::Receiver<bool>,
     deadline: tokio::time::Instant,
 ) -> Result<()> {
     let mut attempt = 0_u32;
     let recovery_started = Instant::now();
     loop {
+        if *stop.borrow() || tokio::time::Instant::now() >= deadline {
+            return Ok(());
+        }
         metrics.connection_attempts.fetch_add(1, Ordering::Relaxed);
-        match connection::connect(&config.target, &config.tls, &config.timeouts).await {
+        let connect = connection::connect(&config.target, &config.tls, &config.timeouts);
+        let connection_result = tokio::select! {
+            result = connect => result,
+            () = wait_for_stop(&mut stop) => return Ok(()),
+            () = tokio::time::sleep_until(deadline) => return Ok(()),
+        };
+        let failure = match connection_result {
             Ok(connection) => {
                 metrics.connection_successes.fetch_add(1, Ordering::Relaxed);
                 metrics.active_connections.fetch_add(1, Ordering::Relaxed);
@@ -121,24 +197,36 @@ async fn run_participant(
                 )
                 .await;
                 metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
-                if result.is_ok()
-                    || !config.reconnect.enabled
-                    || tokio::time::Instant::now() >= deadline
-                {
-                    return result;
+                if let Err(error) = &result {
+                    metrics.connection_failures.fetch_add(1, Ordering::Relaxed);
+                    if config.tls.enabled && is_tls_failure(error) {
+                        metrics.tls_failures.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if attempt > 0 {
+                        metrics.reconnect_failures.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
+                let error = match result {
+                    Ok(()) => return Ok(()),
+                    Err(error) => error,
+                };
+                if !config.reconnect.enabled || tokio::time::Instant::now() >= deadline {
+                    return Err(error);
+                }
+                error
             }
             Err(error) => {
                 metrics.connection_failures.fetch_add(1, Ordering::Relaxed);
-                if config.tls.enabled {
+                if is_tls_failure(&error) {
                     metrics.tls_failures.fetch_add(1, Ordering::Relaxed);
                 }
                 if !config.reconnect.enabled {
                     return Err(error);
                 }
                 metrics.reconnect_failures.fetch_add(1, Ordering::Relaxed);
+                error
             }
-        }
+        };
         if attempt >= config.reconnect.max_attempts {
             bail!(
                 "participant {} exhausted reconnect attempts",
@@ -146,8 +234,21 @@ async fn run_participant(
             );
         }
         attempt += 1;
-        tokio::time::sleep(reconnect_delay(&config, attempt)).await;
+        if !wait_for_delay(reconnect_delay(&config, attempt), &mut stop, deadline).await {
+            return if *stop.borrow() { Ok(()) } else { Err(failure) };
+        }
     }
+}
+
+fn is_tls_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<tak_bench_core::connection::ConnectError>()
+            .is_some_and(tak_bench_core::connection::ConnectError::is_tls)
+            || cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::InvalidData)
+    })
 }
 
 fn reconnect_delay(config: &AppConfig, attempt: u32) -> std::time::Duration {
@@ -175,23 +276,16 @@ async fn run_connected(
     connection: connection::ClientConnection,
 ) -> Result<()> {
     let (reader, mut writer) = connection.into_split();
-    if config.scenario.slow_connect.enabled && participant.role != ParticipantRole::ReceiveOnly {
-        let delay_deadline =
-            tokio::time::Instant::now() + config.scenario.slow_connect.initial_write_delay;
-        loop {
-            if *stop.borrow() || tokio::time::Instant::now() >= deadline {
-                return Ok(());
-            }
-            tokio::select! {
-                () = tokio::time::sleep_until(delay_deadline) => break,
-                changed = stop.changed() => {
-                    if changed.is_err() || *stop.borrow() {
-                        return Ok(());
-                    }
-                }
-                () = tokio::time::sleep_until(deadline) => return Ok(()),
-            }
-        }
+    if config.scenario.slow_connect.enabled
+        && participant.role != ParticipantRole::ReceiveOnly
+        && !wait_for_delay(
+            config.scenario.slow_connect.initial_write_delay,
+            &mut stop,
+            deadline,
+        )
+        .await
+    {
+        return Ok(());
     }
     if participant.role == ParticipantRole::ReceiveOnly {
         return read_events(
@@ -262,17 +356,28 @@ async fn read_events(
 ) -> Result<()> {
     let mut decoder = CotStreamDecoder::new(8 * 1024 * 1024);
     let mut buffer = [0_u8; 8192];
-    if let Some(pause) = participant.pause_read_for {
-        tokio::time::sleep(pause).await;
+    if let Some(pause) = participant.pause_read_for
+        && !wait_for_delay(pause, stop, deadline).await
+    {
+        return Ok(());
     }
     loop {
         tokio::select! {
             changed = stop.changed() => if changed.is_err() || *stop.borrow() { return Ok(()); },
             () = tokio::time::sleep_until(deadline) => return Ok(()),
             result = tokio::time::timeout(read_timeout, reader.read(&mut buffer)) => {
-                let count = result.map_err(|_| anyhow::anyhow!("read timed out"))??;
+                let count = if let Ok(result) = result {
+                    result?
+                } else {
+                    metrics.message_timeouts.fetch_add(1, Ordering::Relaxed);
+                    bail!("read timed out");
+                };
                 if count == 0 { bail!("peer closed the connection before the run deadline"); }
-                if let Some(delay) = participant.read_delay { tokio::time::sleep(delay).await; }
+                if let Some(delay) = participant.read_delay
+                    && !wait_for_delay(delay, stop, deadline).await
+                {
+                    return Ok(());
+                }
                 for raw in decoder.push(&buffer[..count])? {
                     let event = inspect_event(raw)?; metrics.received_messages.fetch_add(1, Ordering::Relaxed);
                     if let Some(correlation) = event.correlation_id { let mut state = ledger.lock().await;
@@ -294,66 +399,134 @@ async fn send_positions(
     stop: &mut watch::Receiver<bool>,
     deadline: tokio::time::Instant,
 ) -> Result<()> {
-    let mut ticker = interval(config.run.gps_interval);
+    let mut ticker = interval(emission_interval(config));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     ticker.tick().await;
-    let mut batch = Vec::new();
+    let mut batch = OutgoingBatch::default();
     let batch_size = config.scenario.fragmentation.events_per_write.max(1);
-    let mut batched_events = 0_u64;
     let mut event_count = 0;
     loop {
         tokio::select! {
             _ = ticker.tick() => {
                 let invalid_kind = invalid_kind(config, event_count);
-                let xml = invalid_or_position(participant, config, event_count);
+                let invalid_xml = invalid_or_position(participant, config, event_count);
                 let correlation = Uuid::new_v4();
-                let xml = xml.unwrap_or_else(|| position_xml(participant, config, correlation));
-                ledger.lock().await.sent.insert(correlation, (participant.id.clone(), Instant::now()));
+                let xml = invalid_xml.unwrap_or_else(|| position_xml(participant, config, correlation));
                 event_count += 1;
                 if invalid_kind == Some(InvalidEventKind::OversizedFrame) {
-                    flush_batch(writer, config, metrics, &mut batch, &mut batched_events).await?;
-                    write_fragmented(writer, xml.as_bytes(), &config.scenario.fragmentation.chunk_sizes, config.timeouts.write).await?;
+                    flush_batch(writer, participant, config, metrics, ledger, &mut batch).await?;
+                    if let Err(error) = write_fragmented(writer, xml.as_bytes(), &config.scenario.fragmentation.chunk_sizes, config.timeouts.write).await {
+                        record_write_failure(metrics, 1, &error);
+                        return Err(error);
+                    }
                     metrics.sent_messages.fetch_add(1, Ordering::Relaxed);
                 } else {
-                    batch.extend_from_slice(xml.as_bytes());
-                    batched_events += 1;
-                    if batch.len() > 8 * 1024 * 1024 { bail!("outgoing batch exceeds frame safety limit"); }
-                    if batched_events >= u64::try_from(batch_size).unwrap_or(u64::MAX) {
-                        flush_batch(writer, config, metrics, &mut batch, &mut batched_events).await?;
+                    batch.bytes.extend_from_slice(xml.as_bytes());
+                    batch.events += 1;
+                    if invalid_kind.is_none() {
+                        batch.correlations.push((correlation, Instant::now()));
+                    }
+                    if batch.bytes.len() > 8 * 1024 * 1024 {
+                        record_local_drop(metrics, batch.events);
+                        bail!("outgoing batch exceeds frame safety limit");
+                    }
+                    if batch.events >= u64::try_from(batch_size).unwrap_or(u64::MAX) {
+                        flush_batch(writer, participant, config, metrics, ledger, &mut batch).await?;
                     }
                 }
-                if config.scenario.abrupt_disconnect.enabled && event_count >= config.scenario.abrupt_disconnect.after_events.max(1) { return Ok(()); }
+                if config.scenario.abrupt_disconnect.enabled
+                    && event_count
+                        >= config.scenario.abrupt_disconnect.after_events.max(1)
+                {
+                    if batch.events > 0 {
+                        record_local_drop(metrics, batch.events);
+                    }
+                    return Ok(());
+                }
             }
             changed = stop.changed() => if changed.is_err() || *stop.borrow() { break; },
             () = tokio::time::sleep_until(deadline) => break,
         }
     }
-    flush_batch(writer, config, metrics, &mut batch, &mut batched_events).await?;
+    if batch.events > 0 {
+        record_local_drop(metrics, batch.events);
+    }
     Ok(())
+}
+
+#[derive(Default)]
+struct OutgoingBatch {
+    bytes: Vec<u8>,
+    correlations: Vec<(Uuid, Instant)>,
+    events: u64,
+}
+
+fn emission_interval(config: &AppConfig) -> std::time::Duration {
+    config.run.max_rate.map_or(config.run.gps_interval, |rate| {
+        config
+            .run
+            .gps_interval
+            .max(std::time::Duration::from_secs_f64(1.0 / rate))
+    })
+}
+
+fn record_local_drop(metrics: &Metrics, events: u64) {
+    metrics
+        .local_dropped_messages
+        .fetch_add(events, Ordering::Relaxed);
+    metrics
+        .dropped_messages
+        .fetch_add(events, Ordering::Relaxed);
+}
+
+fn record_write_failure(metrics: &Metrics, events: u64, error: &anyhow::Error) {
+    metrics
+        .dropped_messages
+        .fetch_add(events, Ordering::Relaxed);
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<tokio::time::error::Elapsed>()
+            .is_some()
+    }) {
+        metrics
+            .message_timeouts
+            .fetch_add(events, Ordering::Relaxed);
+    }
 }
 
 async fn flush_batch(
     writer: &mut ConnectionWriter,
+    participant: &ParticipantConfig,
     config: &AppConfig,
     metrics: &Metrics,
-    batch: &mut Vec<u8>,
-    batched_events: &mut u64,
+    ledger: &Mutex<CorrelationLedger>,
+    batch: &mut OutgoingBatch,
 ) -> Result<()> {
-    if batch.is_empty() {
+    if batch.bytes.is_empty() {
         return Ok(());
     }
-    write_fragmented(
+    if let Err(error) = write_fragmented(
         writer,
-        batch,
+        &batch.bytes,
         &config.scenario.fragmentation.chunk_sizes,
         config.timeouts.write,
     )
-    .await?;
+    .await
+    {
+        record_write_failure(metrics, batch.events, &error);
+        return Err(error);
+    }
     metrics
         .sent_messages
-        .fetch_add(*batched_events, Ordering::Relaxed);
-    batch.clear();
-    *batched_events = 0;
+        .fetch_add(batch.events, Ordering::Relaxed);
+    let mut state = ledger.lock().await;
+    for (correlation, sent_at) in batch.correlations.drain(..) {
+        state
+            .sent
+            .insert(correlation, (participant.id.clone(), sent_at));
+    }
+    batch.bytes.clear();
+    batch.events = 0;
     Ok(())
 }
 
@@ -481,7 +654,8 @@ fn evaluate_routing(
                 .count() as u64;
             AssertionResult {
                 sender: assertion.sender.clone(),
-                passed: expected == (correlations.len() * assertion.receivers.len()) as u64
+                passed: !correlations.is_empty()
+                    && expected == (correlations.len() * assertion.receivers.len()) as u64
                     && forbidden == 0,
                 expected_receivers: expected,
                 forbidden_receivers: forbidden,
@@ -507,8 +681,8 @@ mod tests {
     use std::{path::PathBuf, sync::atomic::AtomicUsize};
     use tak_bench_core::{
         config::{
-            Environment, InvalidScenarioConfig, RampStep, RampStrategy, ReconnectConfig,
-            RoutingAssertion, SchedulerConfig, SlowConnectConfig,
+            AbruptDisconnectConfig, Environment, InvalidScenarioConfig, RampStep, RampStrategy,
+            ReconnectConfig, RoutingAssertion, SchedulerConfig, SlowConnectConfig,
         },
         safety,
     };
@@ -916,6 +1090,7 @@ mod tests {
         let accepted = Arc::new(AtomicUsize::new(0));
         let server = tokio::spawn(relay(listener, Arc::clone(&accepted)));
         let mut config = loopback_config(address);
+        config.run.clients = 2;
         config.participants = vec![
             ParticipantConfig {
                 id: "sender".into(),
@@ -954,6 +1129,7 @@ mod tests {
         let accepted = Arc::new(AtomicUsize::new(0));
         let server = tokio::spawn(relay(listener, Arc::clone(&accepted)));
         let mut config = loopback_config(address);
+        config.run.clients = 3;
         config.run.duration = std::time::Duration::from_secs(3);
         config.run.gps_interval = std::time::Duration::from_secs(1);
         config.timeouts.read = std::time::Duration::from_secs(5);
@@ -1297,6 +1473,187 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn participant_failure_cancels_and_joins_remaining_work() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (first, _) = listener.accept().await.unwrap();
+            let (mut second, _) = listener.accept().await.unwrap();
+            drop(first);
+            let mut received = Vec::new();
+            second.read_to_end(&mut received).await.unwrap();
+            received
+        });
+        let mut config = loopback_config(address);
+        config.run.clients = 2;
+        config.run.duration = std::time::Duration::from_secs(60);
+        config.timeouts.read = std::time::Duration::from_secs(60);
+        config.participants = vec![
+            ParticipantConfig {
+                id: "failing".into(),
+                role: ParticipantRole::ReceiveOnly,
+                ..ParticipantConfig::default()
+            },
+            ParticipantConfig {
+                id: "cancelled".into(),
+                role: ParticipantRole::ReceiveOnly,
+                ..ParticipantConfig::default()
+            },
+        ];
+        let metrics = Arc::new(Metrics::new());
+        let (_stop_tx, stop) = watch::channel(false);
+        assert!(
+            run_fixed_positions(config, Arc::clone(&metrics), stop)
+                .await
+                .is_err()
+        );
+        assert!(server.await.unwrap().is_empty());
+        assert_eq!(metrics.active_connections.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.connection_attempts.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_discards_pending_batches_without_writing() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = accepted_tx.send(());
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+            received
+        });
+        let mut config = loopback_config(address);
+        config.run.duration = std::time::Duration::from_secs(60);
+        config.run.gps_interval = std::time::Duration::from_secs(1);
+        config.scenario.fragmentation.events_per_write = 2;
+        config.participants = vec![ParticipantConfig {
+            id: "batched".into(),
+            role: ParticipantRole::SendOnly,
+            ..ParticipantConfig::default()
+        }];
+        let metrics = Arc::new(Metrics::new());
+        let (stop_tx, stop) = watch::channel(false);
+        let runner = tokio::spawn(run_fixed_positions(config, Arc::clone(&metrics), stop));
+        accepted_rx.await.unwrap();
+        wait_for_connections(&metrics, 1).await;
+        tokio::time::advance(std::time::Duration::from_millis(1_500)).await;
+        tokio::task::yield_now().await;
+        stop_tx.send(true).unwrap();
+        assert!(runner.await.unwrap().is_ok());
+        assert!(server.await.unwrap().is_empty());
+        assert_eq!(metrics.sent_messages.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.local_dropped_messages.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.dropped_messages.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn abrupt_disconnect_accounts_for_an_unflushed_batch() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+            received
+        });
+        let mut config = loopback_config(address);
+        config.scenario.fragmentation.events_per_write = 2;
+        config.scenario.abrupt_disconnect = AbruptDisconnectConfig {
+            enabled: true,
+            after_events: 1,
+        };
+        config.participants = vec![ParticipantConfig {
+            id: "abrupt-batch".into(),
+            role: ParticipantRole::SendOnly,
+            ..ParticipantConfig::default()
+        }];
+        let metrics = Arc::new(Metrics::new());
+        let (_stop_tx, stop) = watch::channel(false);
+        assert!(
+            run_fixed_positions(config, Arc::clone(&metrics), stop)
+                .await
+                .is_ok()
+        );
+        assert!(server.await.unwrap().is_empty());
+        assert_eq!(metrics.sent_messages.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.local_dropped_messages.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.dropped_messages.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn max_rate_controls_the_runtime_emission_interval() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let (payload_tx, mut payload_rx) = mpsc::channel(1);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = accepted_tx.send(());
+            let mut buffer = [0_u8; 1024];
+            let count = stream.read(&mut buffer).await.unwrap();
+            let _ = payload_tx.send(count).await;
+        });
+        let mut config = loopback_config(address);
+        config.run.duration = std::time::Duration::from_secs(5);
+        config.run.gps_interval = std::time::Duration::from_secs(1);
+        config.run.max_rate = Some(0.5);
+        config.participants = vec![ParticipantConfig {
+            id: "rate-limited".into(),
+            role: ParticipantRole::SendOnly,
+            ..ParticipantConfig::default()
+        }];
+        let metrics = Arc::new(Metrics::new());
+        let (stop_tx, stop) = watch::channel(false);
+        let runner = tokio::spawn(run_fixed_positions(config, Arc::clone(&metrics), stop));
+        accepted_rx.await.unwrap();
+        wait_for_connections(&metrics, 1).await;
+        tokio::time::advance(std::time::Duration::from_millis(1_999)).await;
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            payload_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        assert!(payload_rx.recv().await.is_some_and(|count| count > 0));
+        stop_tx.send(true).unwrap();
+        assert!(runner.await.unwrap().is_ok());
+        server.await.unwrap();
+        assert_eq!(metrics.sent_messages.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_deadline_preserves_the_last_connection_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let mut config = loopback_config(address);
+        config.run.duration = std::time::Duration::from_secs(1);
+        config.reconnect = ReconnectConfig {
+            enabled: true,
+            min_backoff: std::time::Duration::from_secs(2),
+            max_backoff: std::time::Duration::from_secs(2),
+            max_attempts: 5,
+            jitter_percent: 0,
+        };
+        config.participants = vec![ParticipantConfig {
+            id: "unreachable".into(),
+            role: ParticipantRole::ReceiveOnly,
+            ..ParticipantConfig::default()
+        }];
+        let metrics = Arc::new(Metrics::new());
+        let (_stop_tx, stop) = watch::channel(false);
+        assert!(
+            run_fixed_positions(config, Arc::clone(&metrics), stop)
+                .await
+                .is_err()
+        );
+        assert_eq!(metrics.connection_attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.connection_failures.load(Ordering::Relaxed), 1);
+    }
+
     #[tokio::test]
     async fn eof_triggers_bounded_reconnect() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1343,11 +1700,14 @@ mod tests {
             ..ParticipantConfig::default()
         }];
         let (_stop_tx, stop) = watch::channel(false);
+        let metrics = Arc::new(Metrics::new());
         assert!(
-            run_fixed_positions(config, Arc::new(Metrics::new()), stop)
+            run_fixed_positions(config, Arc::clone(&metrics), stop)
                 .await
                 .is_err()
         );
+        assert_eq!(metrics.message_timeouts.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.connection_failures.load(Ordering::Relaxed), 1);
         server.abort();
     }
 
@@ -1398,6 +1758,18 @@ mod tests {
                     timeout: None
                 }],
                 &state
+            )[0]
+            .passed
+        );
+        assert!(
+            !evaluate_routing(
+                &[RoutingAssertion {
+                    sender: "missing".into(),
+                    receivers: vec!["receiver".into()],
+                    forbidden_receivers: vec![],
+                    timeout: None,
+                }],
+                &CorrelationLedger::default(),
             )[0]
             .passed
         );

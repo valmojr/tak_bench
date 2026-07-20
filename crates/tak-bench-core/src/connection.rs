@@ -1,12 +1,15 @@
 use std::{
-    fs::File,
-    io::BufReader,
+    fs,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
-use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
+use rustls::{
+    ClientConfig, RootCertStore,
+    pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject},
+};
+use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
     net::TcpStream,
@@ -14,6 +17,21 @@ use tokio::{
 use tokio_rustls::TlsConnector;
 
 use crate::config::{TargetConfig, TimeoutConfig, TlsConfig};
+
+#[derive(Debug, Error)]
+pub enum ConnectError {
+    #[error("TCP connection failed")]
+    Tcp(#[source] anyhow::Error),
+    #[error("TLS connection failed")]
+    Tls(#[source] anyhow::Error),
+}
+
+impl ConnectError {
+    #[must_use]
+    pub fn is_tls(&self) -> bool {
+        matches!(self, Self::Tls(_))
+    }
+}
 
 pub trait AsyncStream: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T> AsyncStream for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -72,8 +90,9 @@ pub async fn connect(
     let started = Instant::now();
     let tcp = tokio::time::timeout(timeouts.connect, TcpStream::connect(&target.server))
         .await
-        .context("connect timed out")?
-        .with_context(|| format!("connecting to {}", target.server))?;
+        .context("connect timed out")
+        .and_then(|result| result.with_context(|| format!("connecting to {}", target.server)))
+        .map_err(ConnectError::Tcp)?;
     tcp.set_nodelay(true).context("enabling TCP_NODELAY")?;
     if !tls.enabled {
         return Ok(ClientConnection {
@@ -85,12 +104,15 @@ pub async fn connect(
         .sni
         .as_deref()
         .unwrap_or_else(|| crate::config::host_from_server(&target.server));
-    let server_name = ServerName::try_from(sni.to_owned()).context("invalid TLS SNI hostname")?;
-    let connector = TlsConnector::from(Arc::new(build_tls_config(tls)?));
+    let server_name = ServerName::try_from(sni.to_owned())
+        .context("invalid TLS SNI hostname")
+        .map_err(ConnectError::Tls)?;
+    let connector = TlsConnector::from(Arc::new(build_tls_config(tls).map_err(ConnectError::Tls)?));
     let stream = tokio::time::timeout(timeouts.tls_handshake, connector.connect(server_name, tcp))
         .await
-        .context("TLS handshake timed out")?
-        .context("TLS handshake failed")?;
+        .context("TLS handshake timed out")
+        .and_then(|result| result.context("TLS handshake failed"))
+        .map_err(ConnectError::Tls)?;
     Ok(ClientConnection {
         stream: Box::new(stream),
         handshake_time: started.elapsed(),
@@ -103,10 +125,8 @@ fn build_tls_config(tls: &TlsConfig) -> Result<ClientConfig> {
         .as_ref()
         .context("TLS requires tls.ca; hostname verification cannot be disabled")?;
     let mut roots = RootCertStore::empty();
-    let mut reader = BufReader::new(
-        File::open(ca_path).with_context(|| format!("opening CA {}", ca_path.display()))?,
-    );
-    for cert in rustls_pemfile::certs(&mut reader) {
+    let ca_pem = fs::read(ca_path).with_context(|| format!("opening CA {}", ca_path.display()))?;
+    for cert in CertificateDer::pem_slice_iter(&ca_pem) {
         roots
             .add(cert.context("reading CA certificate")?)
             .context("adding CA certificate")?;
@@ -115,20 +135,15 @@ fn build_tls_config(tls: &TlsConfig) -> Result<ClientConfig> {
     match (&tls.client_cert, &tls.client_key) {
         (None, None) => Ok(builder.with_no_client_auth()),
         (Some(cert_path), Some(key_path)) => {
-            let mut cert_reader =
-                BufReader::new(File::open(cert_path).with_context(|| {
-                    format!("opening client certificate {}", cert_path.display())
-                })?);
-            let certs = rustls_pemfile::certs(&mut cert_reader)
+            let cert_pem = fs::read(cert_path)
+                .with_context(|| format!("opening client certificate {}", cert_path.display()))?;
+            let certs = CertificateDer::pem_slice_iter(&cert_pem)
                 .collect::<Result<Vec<_>, _>>()
                 .context("reading client certificate")?;
-            let mut key_reader = BufReader::new(
-                File::open(key_path)
-                    .with_context(|| format!("opening client key {}", key_path.display()))?,
-            );
-            let key = rustls_pemfile::private_key(&mut key_reader)
-                .context("reading client private key")?
-                .context("client key file contains no private key")?;
+            let key_pem = fs::read(key_path)
+                .with_context(|| format!("opening client key {}", key_path.display()))?;
+            let key =
+                PrivateKeyDer::from_pem_slice(&key_pem).context("reading client private key")?;
             Ok(builder
                 .with_client_auth_cert(certs, key)
                 .context("configuring client certificate")?)

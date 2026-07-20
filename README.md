@@ -27,7 +27,7 @@ cargo run -p tak-bench-cli -- smoke \
   --duration 2m
 ```
 
-A YAML configuration can define TLS/mTLS, participant roles, ramp-up, timeouts, reconnect, routing observations, fragmentation, thresholds, and stable JSON output. CLI flags override equivalent fields. Start with [functional-routing.yaml](examples/functional-routing.yaml).
+A YAML configuration can define TLS/mTLS, participant roles, ramp-up, timeouts, reconnect, routing observations, fragmentation, thresholds, and stable JSON output. CLI flags override equivalent fields. Unsupported scenario and scheduling options are rejected before dialing. Start with [functional-routing.yaml](examples/functional-routing.yaml).
 
 ## Current capabilities
 
@@ -44,8 +44,16 @@ A YAML configuration can define TLS/mTLS, participant roles, ramp-up, timeouts, 
 
 ```bash
 cargo fmt --check
-cargo clippy --workspace -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+cargo build --workspace --release --locked
+cargo package --workspace --locked
 ```
 
 Slow local readers, bounded abrupt disconnects, bounded slow first writes, and carefully rate-limited invalid inputs are opt-in scenario controls. They are never production-safe. See [scenario guidance](docs/scenarios.md).
+
+Before a release tag, run an authorized mTLS preflight and smoke workload against the intended TAK Server version using `examples/smoke-mtls.yaml`. Loopback fixtures validate transport behavior but do not claim compatibility with every server deployment. See the [GitHub Actions and release guide](docs/github-actions.md) for the tag and artifact process.
+
+## License
+
+Licensed under either the [Apache License 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option.

@@ -1,0 +1,183 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  validate:
+    name: validate-tag
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out the tagged revision
+        uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88.0"
+      - name: Validate the tag and Cargo version
+        id: version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tags must use the stable vX.Y.Z format; got: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          version="$(cargo metadata --format-version 1 --no-deps --locked | jq -r '.packages[] | select(.name == "tak-bench-cli") | .version')"
+          if [[ -z "$version" || "$version" == "null" ]]; then
+            echo "Could not read the tak-bench-cli version from Cargo metadata" >&2
+            exit 1
+          fi
+
+          if [[ "$RELEASE_TAG" != "v$version" ]]; then
+            echo "Tag $RELEASE_TAG does not match Cargo version $version" >&2
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  verify:
+    name: verify
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      issues: write
+
+  build:
+    name: build-${{ matrix.target }}
+    needs:
+      - validate
+      - verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            archive: tar.gz
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out the tagged revision
+        uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88.0"
+          targets: ${{ matrix.target }}
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build tak-bench
+        run: cargo build --package tak-bench-cli --bin tak-bench --release --locked --target ${{ matrix.target }}
+
+      - name: Package Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RUST_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          package="tak-bench-${RELEASE_TAG}-${RUST_TARGET}"
+          package_dir="dist/${package}"
+          mkdir -p "$package_dir"
+          cp "target/${RUST_TARGET}/release/tak-bench" "$package_dir/"
+          cp README.md LICENSE-APACHE LICENSE-MIT "$package_dir/"
+          tar -C dist -czf "dist/${package}.tar.gz" "$package"
+
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RUST_TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $package = "tak-bench-$env:RELEASE_TAG-$env:RUST_TARGET"
+          $packageDir = Join-Path "dist" $package
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+          Copy-Item "target/$env:RUST_TARGET/release/tak-bench.exe" $packageDir
+          Copy-Item "README.md", "LICENSE-APACHE", "LICENSE-MIT" $packageDir
+          Compress-Archive -Path "$packageDir/*" -DestinationPath "dist/$package.zip"
+
+      - name: Upload packaged binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/tak-bench-${{ github.ref_name }}-${{ matrix.target }}.${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish-github-release
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged binaries
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Generate SHA-256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum tak-bench-* > SHA256SUMS
+      - name: Create or update the GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if release_is_draft="$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' --repo "$GITHUB_REPOSITORY" 2>/dev/null)"; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+            if [[ "$release_is_draft" == "true" ]]; then
+              gh release edit "$RELEASE_TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+            fi
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --verify-tag \
+              --generate-notes \
+              --title "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY"
+          fi

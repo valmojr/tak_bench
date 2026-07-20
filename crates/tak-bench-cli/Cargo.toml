@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Authorized, server-neutral TAK/CoT transport benchmark CLI"
 
 [[bin]]
 name = "tak-bench"
@@ -13,9 +18,9 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 serde_yaml.workspace = true
-tak-bench-core = { path = "../tak-bench-core" }
-tak-bench-report = { path = "../tak-bench-report" }
-tak-bench-scenarios = { path = "../tak-bench-scenarios" }
+tak-bench-core = { version = "0.1.0", path = "../tak-bench-core" }
+tak-bench-report = { version = "0.1.0", path = "../tak-bench-report" }
+tak-bench-scenarios = { version = "0.1.0", path = "../tak-bench-scenarios" }
 time.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true

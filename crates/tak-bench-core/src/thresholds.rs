@@ -71,3 +71,43 @@ fn ratio(numerator: u64, denominator: u64) -> f64 {
             / f64::from(u32::try_from(denominator).unwrap_or(u32::MAX))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_timeouts_and_drops_trigger_thresholds() {
+        let message_snapshot = MetricsSnapshot {
+            sent_messages: 10,
+            message_timeouts: 2,
+            ..MetricsSnapshot::default()
+        };
+        assert_eq!(
+            evaluate(
+                &AbortConfig {
+                    message_error_rate: Some(0.1),
+                    ..AbortConfig::default()
+                },
+                &message_snapshot,
+            ),
+            Some(ThresholdViolation::MessageErrorRate(0.2))
+        );
+
+        let drop_snapshot = MetricsSnapshot {
+            sent_messages: 1,
+            dropped_messages: 1,
+            ..MetricsSnapshot::default()
+        };
+        assert_eq!(
+            evaluate(
+                &AbortConfig {
+                    max_dropped_messages: Some(0),
+                    ..AbortConfig::default()
+                },
+                &drop_snapshot,
+            ),
+            Some(ThresholdViolation::DroppedMessages(1))
+        );
+    }
+}

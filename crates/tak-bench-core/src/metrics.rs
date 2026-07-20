@@ -53,7 +53,7 @@ impl Default for Metrics {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct MetricsSnapshot {
     pub connection_attempts: u64,
     pub connection_successes: u64,
