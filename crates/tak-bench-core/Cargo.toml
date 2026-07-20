@@ -9,6 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
 description = "Safe transport, configuration, scheduling, and metrics primitives for TAK Bench"
+publish = false
 
 [dependencies]
 anyhow.workspace = true

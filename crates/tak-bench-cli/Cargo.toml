@@ -9,6 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
 description = "Authorized, server-neutral TAK/CoT transport benchmark CLI"
+publish = false
 
 [[bin]]
 name = "tak-bench"

@@ -78,8 +78,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Build the release profile
         run: cargo build --workspace --release --locked
-      - name: Verify crate packages
-        run: cargo package --workspace --locked
+      - name: Validate workspace metadata
+        run: cargo metadata --no-deps --locked --format-version 1 > /dev/null
 
   audit:
     name: audit

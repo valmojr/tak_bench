@@ -9,6 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
 description = "Server-neutral workload scenarios for TAK Bench"
+publish = false
 
 [dependencies]
 anyhow.workspace = true

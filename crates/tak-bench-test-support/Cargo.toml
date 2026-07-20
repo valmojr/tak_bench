@@ -9,6 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
 description = "Loopback fixture and provisioning test support for TAK Bench"
+publish = false
 
 [dependencies]
 tokio.workspace = true
