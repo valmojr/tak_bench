@@ -105,7 +105,7 @@ pub fn validate_with_options(
         }
         if config.scenario.invalid.max_events.is_none()
             || config.run.max_rate.is_some_and(|rate| rate > 1.0)
-            || config.run.max_rate.is_none() && config.run.gps_interval < Duration::from_secs(1)
+            || config.run.gps_interval < Duration::from_secs(1)
         {
             return Err(SafetyError::InvalidEventLimit);
         }
@@ -165,6 +165,65 @@ mod tests {
             validate(&config, false),
             Err(SafetyError::InvalidEventLimit)
         );
+    }
+
+    #[test]
+    fn invalid_event_kinds_are_blocked_in_production_and_cannot_bypass_rate_limit() {
+        use crate::config::{InvalidEventKind, InvalidScenarioConfig, ScenarioConfig};
+
+        let kinds = [
+            InvalidEventKind::MalformedXml,
+            InvalidEventKind::UnterminatedXml,
+            InvalidEventKind::OversizedFrame,
+            InvalidEventKind::InvalidCoordinates,
+            InvalidEventKind::InvalidTime,
+        ];
+        for kind in kinds {
+            let scenario = ScenarioConfig {
+                invalid: InvalidScenarioConfig {
+                    enabled: true,
+                    kind: Some(kind),
+                    max_events: Some(2),
+                },
+                ..ScenarioConfig::default()
+            };
+            let production = AppConfig {
+                authorization: crate::config::AuthorizationConfig { acknowledged: true },
+                environment: Environment::Production,
+                allow_hosts: vec!["example.test".into()],
+                target: crate::config::TargetConfig {
+                    server: "example.test:8089".into(),
+                    sni: None,
+                },
+                scenario: scenario.clone(),
+                ..AppConfig::default()
+            };
+            assert_eq!(
+                validate_with_options(
+                    &production,
+                    SafetyOptions {
+                        allow_production: true,
+                        allow_invalid_events: true,
+                    },
+                ),
+                Err(SafetyError::InvalidEventsNotAllowed)
+            );
+
+            let rate_bypass = AppConfig {
+                authorization: crate::config::AuthorizationConfig { acknowledged: true },
+                scenario,
+                run: crate::config::RunConfig {
+                    gps_interval: Duration::from_millis(999),
+                    max_rate: Some(1.0),
+                    ..crate::config::RunConfig::default()
+                },
+                ..AppConfig::default()
+            };
+            assert_eq!(
+                validate(&rate_bypass, false),
+                Err(SafetyError::InvalidEventLimit)
+            );
+        }
     }
 
     #[test]

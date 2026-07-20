@@ -175,8 +175,23 @@ async fn run_connected(
     connection: connection::ClientConnection,
 ) -> Result<()> {
     let (reader, mut writer) = connection.into_split();
-    if config.scenario.slow_connect.enabled {
-        tokio::time::sleep(config.scenario.slow_connect.initial_write_delay).await;
+    if config.scenario.slow_connect.enabled && participant.role != ParticipantRole::ReceiveOnly {
+        let delay_deadline =
+            tokio::time::Instant::now() + config.scenario.slow_connect.initial_write_delay;
+        loop {
+            if *stop.borrow() || tokio::time::Instant::now() >= deadline {
+                return Ok(());
+            }
+            tokio::select! {
+                () = tokio::time::sleep_until(delay_deadline) => break,
+                changed = stop.changed() => {
+                    if changed.is_err() || *stop.borrow() {
+                        return Ok(());
+                    }
+                }
+                () = tokio::time::sleep_until(deadline) => return Ok(()),
+            }
+        }
     }
     if participant.role == ParticipantRole::ReceiveOnly {
         return read_events(
@@ -283,36 +298,62 @@ async fn send_positions(
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     ticker.tick().await;
     let mut batch = Vec::new();
-    let batch_size =
-        u32::try_from(config.scenario.fragmentation.events_per_write.max(1)).unwrap_or(u32::MAX);
+    let batch_size = config.scenario.fragmentation.events_per_write.max(1);
+    let mut batched_events = 0_u64;
     let mut event_count = 0;
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-            let xml = invalid_or_position(participant, config, event_count);
+                let invalid_kind = invalid_kind(config, event_count);
+                let xml = invalid_or_position(participant, config, event_count);
                 let correlation = Uuid::new_v4();
                 let xml = xml.unwrap_or_else(|| position_xml(participant, config, correlation));
                 ledger.lock().await.sent.insert(correlation, (participant.id.clone(), Instant::now()));
-                batch.extend_from_slice(xml.as_bytes()); event_count += 1;
-                if batch.len() > 8 * 1024 * 1024 { bail!("outgoing batch exceeds frame safety limit"); }
-                if event_count % batch_size == 0 { write_fragmented(writer, &batch, &config.scenario.fragmentation.chunk_sizes, config.timeouts.write).await?; metrics.sent_messages.fetch_add(u64::from(batch_size), Ordering::Relaxed); batch.clear(); }
+                event_count += 1;
+                if invalid_kind == Some(InvalidEventKind::OversizedFrame) {
+                    flush_batch(writer, config, metrics, &mut batch, &mut batched_events).await?;
+                    write_fragmented(writer, xml.as_bytes(), &config.scenario.fragmentation.chunk_sizes, config.timeouts.write).await?;
+                    metrics.sent_messages.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    batch.extend_from_slice(xml.as_bytes());
+                    batched_events += 1;
+                    if batch.len() > 8 * 1024 * 1024 { bail!("outgoing batch exceeds frame safety limit"); }
+                    if batched_events >= u64::try_from(batch_size).unwrap_or(u64::MAX) {
+                        flush_batch(writer, config, metrics, &mut batch, &mut batched_events).await?;
+                    }
+                }
                 if config.scenario.abrupt_disconnect.enabled && event_count >= config.scenario.abrupt_disconnect.after_events.max(1) { return Ok(()); }
             }
             changed = stop.changed() => if changed.is_err() || *stop.borrow() { break; },
             () = tokio::time::sleep_until(deadline) => break,
         }
     }
-    if !batch.is_empty() {
-        let events = u64::from(event_count % batch_size);
-        write_fragmented(
-            writer,
-            &batch,
-            &config.scenario.fragmentation.chunk_sizes,
-            config.timeouts.write,
-        )
-        .await?;
-        metrics.sent_messages.fetch_add(events, Ordering::Relaxed);
+    flush_batch(writer, config, metrics, &mut batch, &mut batched_events).await?;
+    Ok(())
+}
+
+async fn flush_batch(
+    writer: &mut ConnectionWriter,
+    config: &AppConfig,
+    metrics: &Metrics,
+    batch: &mut Vec<u8>,
+    batched_events: &mut u64,
+) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
     }
+    write_fragmented(
+        writer,
+        batch,
+        &config.scenario.fragmentation.chunk_sizes,
+        config.timeouts.write,
+    )
+    .await?;
+    metrics
+        .sent_messages
+        .fetch_add(*batched_events, Ordering::Relaxed);
+    batch.clear();
+    *batched_events = 0;
     Ok(())
 }
 
@@ -344,27 +385,30 @@ fn invalid_or_position(
     config: &AppConfig,
     count: u32,
 ) -> Option<String> {
+    Some(match invalid_kind(config, count)? {
+        InvalidEventKind::MalformedXml => "<event".into(),
+        InvalidEventKind::UnterminatedXml => "<event uid=\"invalid\">".into(),
+        InvalidEventKind::OversizedFrame => {
+            format!("<event>{}</event>", "x".repeat(8 * 1024 * 1024 + 1))
+        }
+        InvalidEventKind::InvalidCoordinates => {
+            "<event><point lat=\"nan\" lon=\"999\"/></event>".into()
+        }
+        InvalidEventKind::InvalidTime => "<event time=\"not-a-time\"></event>".into(),
+    })
+}
+
+fn invalid_kind(config: &AppConfig, count: u32) -> Option<InvalidEventKind> {
     if !config.scenario.invalid.enabled || count >= config.scenario.invalid.max_events.unwrap_or(0)
     {
         return None;
     }
     Some(
-        match config
+        config
             .scenario
             .invalid
             .kind
-            .unwrap_or(InvalidEventKind::MalformedXml)
-        {
-            InvalidEventKind::MalformedXml => "<event".into(),
-            InvalidEventKind::UnterminatedXml => "<event uid=\"invalid\">".into(),
-            InvalidEventKind::OversizedFrame => {
-                format!("<event>{}</event>", "x".repeat(8 * 1024 * 1024 + 1))
-            }
-            InvalidEventKind::InvalidCoordinates => {
-                "<event><point lat=\"nan\" lon=\"999\"/></event>".into()
-            }
-            InvalidEventKind::InvalidTime => "<event time=\"not-a-time\"></event>".into(),
-        },
+            .unwrap_or(InvalidEventKind::MalformedXml),
     )
 }
 
@@ -454,18 +498,143 @@ pub fn minimum_stale_interval(interval: std::time::Duration) -> std::time::Durat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+    use rcgen::{BasicConstraints, Certificate, CertificateParams, IsCa, KeyPair};
     use rustls::{
         RootCertStore, ServerConfig,
         pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
         server::WebPkiClientVerifier,
     };
-    use std::sync::atomic::AtomicUsize;
-    use tak_bench_core::config::{ReconnectConfig, RoutingAssertion};
+    use std::{path::PathBuf, sync::atomic::AtomicUsize};
+    use tak_bench_core::{
+        config::{
+            Environment, InvalidScenarioConfig, RampStep, RampStrategy, ReconnectConfig,
+            RoutingAssertion, SchedulerConfig, SlowConnectConfig,
+        },
+        safety,
+    };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
+        net::{
+            TcpListener,
+            tcp::{OwnedReadHalf, OwnedWriteHalf},
+        },
+        sync::{mpsc, oneshot},
     };
+
+    struct TestAuthority {
+        certificate: Certificate,
+        key: KeyPair,
+    }
+
+    impl TestAuthority {
+        fn new(name: &str) -> Self {
+            let mut params = CertificateParams::new(vec![name.into()]).unwrap();
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            let key = KeyPair::generate().unwrap();
+            let certificate = params.self_signed(&key).unwrap();
+            Self { certificate, key }
+        }
+
+        fn issue(&self, name: &str) -> (Certificate, KeyPair) {
+            let key = KeyPair::generate().unwrap();
+            let certificate = CertificateParams::new(vec![name.into()])
+                .unwrap()
+                .signed_by(&key, &self.certificate, &self.key)
+                .unwrap();
+            (certificate, key)
+        }
+    }
+
+    #[derive(Default)]
+    struct TempPemFiles {
+        paths: Vec<PathBuf>,
+    }
+
+    impl TempPemFiles {
+        fn write(&mut self, label: &str, contents: impl AsRef<[u8]>) -> PathBuf {
+            let path = PathBuf::from("/tmp")
+                .join(format!("tak-bench-test-{}-{label}.pem", Uuid::new_v4()));
+            std::fs::write(&path, contents).unwrap();
+            self.paths.push(path.clone());
+            path
+        }
+    }
+
+    impl Drop for TempPemFiles {
+        fn drop(&mut self) {
+            for path in &self.paths {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    fn client_tls(
+        files: &mut TempPemFiles,
+        server_ca: &Certificate,
+        identity: Option<(&Certificate, &KeyPair)>,
+    ) -> tak_bench_core::config::TlsConfig {
+        let ca = files.write("ca", server_ca.pem());
+        let (client_cert, client_key) = identity.map_or((None, None), |(certificate, key)| {
+            (
+                Some(files.write("client-cert", certificate.pem())),
+                Some(files.write("client-key", key.serialize_pem())),
+            )
+        });
+        tak_bench_core::config::TlsConfig {
+            enabled: true,
+            ca: Some(ca),
+            client_cert,
+            client_key,
+            ..tak_bench_core::config::TlsConfig::default()
+        }
+    }
+
+    fn server_config(
+        server: &Certificate,
+        server_key: &KeyPair,
+        client_ca: Option<&Certificate>,
+    ) -> ServerConfig {
+        let builder = ServerConfig::builder();
+        let builder = if let Some(client_ca) = client_ca {
+            let mut roots = RootCertStore::empty();
+            roots.add(client_ca.der().clone()).unwrap();
+            let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+                .build()
+                .unwrap();
+            builder.with_client_cert_verifier(verifier)
+        } else {
+            builder.with_no_client_auth()
+        };
+        builder
+            .with_single_cert(
+                vec![server.der().clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der())),
+            )
+            .unwrap()
+    }
+
+    async fn tls_server(
+        config: ServerConfig,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<bool>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let task = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            acceptor.accept(tcp).await.is_ok()
+        });
+        (address, task)
+    }
+
+    fn tls_target(
+        address: std::net::SocketAddr,
+        sni: &str,
+    ) -> tak_bench_core::config::TargetConfig {
+        tak_bench_core::config::TargetConfig {
+            server: address.to_string(),
+            sni: Some(sni.into()),
+        }
+    }
 
     fn loopback_config(address: std::net::SocketAddr) -> AppConfig {
         AppConfig {
@@ -528,101 +697,117 @@ mod tests {
         }
     }
 
+    async fn relay_direction(
+        mut reader: OwnedReadHalf,
+        mut writer: OwnedWriteHalf,
+        direction: usize,
+        observed: mpsc::Sender<usize>,
+    ) {
+        let mut buffer = [0_u8; 4096];
+        let mut reported = false;
+        loop {
+            match reader.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(count) => {
+                    if !reported {
+                        reported = true;
+                        let _ = observed.send(direction).await;
+                    }
+                    if writer.write_all(&buffer[..count]).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn abrupt_disconnect_server(
+        listener: TcpListener,
+        accepted: Arc<AtomicUsize>,
+        first_closed: oneshot::Sender<()>,
+        stable_ready: oneshot::Sender<()>,
+        directions: mpsc::Sender<usize>,
+        reconnects: usize,
+    ) {
+        let (first, _) = listener.accept().await.unwrap();
+        accepted.fetch_add(1, Ordering::Relaxed);
+        drop(first);
+        let _ = first_closed.send(());
+
+        let (stable_a, _) = listener.accept().await.unwrap();
+        accepted.fetch_add(1, Ordering::Relaxed);
+        let (stable_b, _) = listener.accept().await.unwrap();
+        accepted.fetch_add(1, Ordering::Relaxed);
+        let (a_read, a_write) = stable_a.into_split();
+        let (b_read, b_write) = stable_b.into_split();
+        tokio::spawn(relay_direction(a_read, b_write, 0, directions.clone()));
+        tokio::spawn(relay_direction(b_read, a_write, 1, directions));
+        let _ = stable_ready.send(());
+
+        for _ in 0..reconnects {
+            let (reconnect, _) = listener.accept().await.unwrap();
+            accepted.fetch_add(1, Ordering::Relaxed);
+            drop(reconnect);
+        }
+    }
+
+    async fn wait_for_sent(metrics: &Metrics, expected: u64) {
+        for _ in 0..10_000 {
+            if metrics.sent_messages.load(Ordering::Relaxed) == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(metrics.sent_messages.load(Ordering::Relaxed), expected);
+    }
+
+    async fn wait_for_connections(metrics: &Metrics, expected: u64) {
+        for _ in 0..10_000 {
+            if metrics.connection_successes.load(Ordering::Relaxed) == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            metrics.connection_successes.load(Ordering::Relaxed),
+            expected
+        );
+    }
+
     #[tokio::test]
     async fn tls_hostname_validation_uses_an_ephemeral_local_ca() {
-        let mut ca_params = CertificateParams::new(vec!["test-ca".into()]).unwrap();
-        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        let ca_key = KeyPair::generate().unwrap();
-        let ca = ca_params.self_signed(&ca_key).unwrap();
-        let server_key = KeyPair::generate().unwrap();
-        let server = CertificateParams::new(vec!["example.test".into()])
-            .unwrap()
-            .signed_by(&server_key, &ca, &ca_key)
-            .unwrap();
-        let config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![server.der().clone()],
-                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der())),
-            )
-            .unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
-        let task = tokio::spawn(async move {
-            let (tcp, _) = listener.accept().await.unwrap();
-            acceptor.accept(tcp).await.unwrap();
-        });
-        let path = std::env::temp_dir().join(format!("tak-bench-test-{}.pem", Uuid::new_v4()));
-        std::fs::write(&path, ca.pem()).unwrap();
-        let target = tak_bench_core::config::TargetConfig {
-            server: address.to_string(),
-            sni: Some("example.test".into()),
-        };
-        let tls = tak_bench_core::config::TlsConfig {
-            enabled: true,
-            ca: Some(path.clone()),
-            ..tak_bench_core::config::TlsConfig::default()
-        };
-        assert!(
-            connection::connect(
-                &target,
-                &tls,
-                &tak_bench_core::config::TimeoutConfig::default()
-            )
-            .await
-            .is_ok()
-        );
-        let _ = std::fs::remove_file(path);
-        task.await.unwrap();
+        let authority = TestAuthority::new("test-ca");
+        let (server, server_key) = authority.issue("example.test");
+        let (address, task) = tls_server(server_config(&server, &server_key, None)).await;
+        let mut files = TempPemFiles::default();
+        let tls = client_tls(&mut files, &authority.certificate, None);
+        let connected = connection::connect(
+            &tls_target(address, "example.test"),
+            &tls,
+            &tak_bench_core::config::TimeoutConfig::default(),
+        )
+        .await
+        .is_ok();
+        assert!(connected);
+        assert!(task.await.unwrap());
     }
 
     #[tokio::test]
     async fn tls_rejects_an_incorrect_sni() {
-        let mut ca_params = CertificateParams::new(vec!["test-ca".into()]).unwrap();
-        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        let ca_key = KeyPair::generate().unwrap();
-        let ca = ca_params.self_signed(&ca_key).unwrap();
-        let key = KeyPair::generate().unwrap();
-        let cert = CertificateParams::new(vec!["example.test".into()])
-            .unwrap()
-            .signed_by(&key, &ca, &ca_key)
-            .unwrap();
-        let config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![cert.der().clone()],
-                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
-            )
-            .unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
-        let task = tokio::spawn(async move {
-            let (tcp, _) = listener.accept().await.unwrap();
-            let _ = acceptor.accept(tcp).await;
-        });
-        let path = std::env::temp_dir().join(format!("tak-bench-test-{}.pem", Uuid::new_v4()));
-        std::fs::write(&path, ca.pem()).unwrap();
-        let tls = tak_bench_core::config::TlsConfig {
-            enabled: true,
-            ca: Some(path.clone()),
-            ..tak_bench_core::config::TlsConfig::default()
-        };
-        assert!(
-            connection::connect(
-                &tak_bench_core::config::TargetConfig {
-                    server: address.to_string(),
-                    sni: Some("wrong.test".into())
-                },
-                &tls,
-                &tak_bench_core::config::TimeoutConfig::default()
-            )
-            .await
-            .is_err()
-        );
-        let _ = std::fs::remove_file(path);
-        task.await.unwrap();
+        let authority = TestAuthority::new("test-ca");
+        let (server, server_key) = authority.issue("example.test");
+        let (address, task) = tls_server(server_config(&server, &server_key, None)).await;
+        let mut files = TempPemFiles::default();
+        let tls = client_tls(&mut files, &authority.certificate, None);
+        let rejected = connection::connect(
+            &tls_target(address, "wrong.test"),
+            &tls,
+            &tak_bench_core::config::TimeoutConfig::default(),
+        )
+        .await
+        .is_err();
+        assert!(rejected);
+        assert!(!task.await.unwrap());
     }
 
     #[tokio::test]
@@ -633,102 +818,95 @@ mod tests {
             let (_tcp, _) = listener.accept().await.unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         });
-        let mut params = CertificateParams::new(vec!["test-ca".into()]).unwrap();
-        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        let key = KeyPair::generate().unwrap();
-        let ca = params.self_signed(&key).unwrap();
-        let path = std::env::temp_dir().join(format!("tak-bench-test-{}.pem", Uuid::new_v4()));
-        std::fs::write(&path, ca.pem()).unwrap();
-        let tls = tak_bench_core::config::TlsConfig {
-            enabled: true,
-            ca: Some(path.clone()),
-            ..tak_bench_core::config::TlsConfig::default()
-        };
+        let authority = TestAuthority::new("test-ca");
+        let mut files = TempPemFiles::default();
+        let tls = client_tls(&mut files, &authority.certificate, None);
         let timeouts = tak_bench_core::config::TimeoutConfig {
             tls_handshake: std::time::Duration::from_millis(10),
             ..tak_bench_core::config::TimeoutConfig::default()
         };
         assert!(
-            connection::connect(
-                &tak_bench_core::config::TargetConfig {
-                    server: address.to_string(),
-                    sni: Some("example.test".into())
-                },
-                &tls,
-                &timeouts
-            )
-            .await
-            .is_err()
+            connection::connect(&tls_target(address, "example.test"), &tls, &timeouts)
+                .await
+                .is_err()
         );
-        let _ = std::fs::remove_file(path);
         task.await.unwrap();
     }
 
     #[tokio::test]
     async fn mtls_requires_and_accepts_an_ephemeral_client_certificate() {
-        let mut params = CertificateParams::new(vec!["test-ca".into()]).unwrap();
-        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        let ca_key = KeyPair::generate().unwrap();
-        let ca = params.self_signed(&ca_key).unwrap();
-        let server_key = KeyPair::generate().unwrap();
-        let server = CertificateParams::new(vec!["example.test".into()])
-            .unwrap()
-            .signed_by(&server_key, &ca, &ca_key)
-            .unwrap();
-        let client_key = KeyPair::generate().unwrap();
-        let client = CertificateParams::new(vec!["client.test".into()])
-            .unwrap()
-            .signed_by(&client_key, &ca, &ca_key)
-            .unwrap();
-        let mut roots = RootCertStore::empty();
-        roots.add(ca.der().clone()).unwrap();
-        let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
-            .build()
-            .unwrap();
-        let config = ServerConfig::builder()
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(
-                vec![server.der().clone()],
-                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der())),
-            )
-            .unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
-        let task = tokio::spawn(async move {
-            let (tcp, _) = listener.accept().await.unwrap();
-            acceptor.accept(tcp).await.unwrap();
-        });
-        let base = std::env::temp_dir().join(format!("tak-bench-test-{}", Uuid::new_v4()));
-        let ca_path = base.with_extension("ca");
-        let cert_path = base.with_extension("cert");
-        let key_path = base.with_extension("key");
-        std::fs::write(&ca_path, ca.pem()).unwrap();
-        std::fs::write(&cert_path, client.pem()).unwrap();
-        std::fs::write(&key_path, client_key.serialize_pem()).unwrap();
-        let tls = tak_bench_core::config::TlsConfig {
-            enabled: true,
-            ca: Some(ca_path.clone()),
-            client_cert: Some(cert_path.clone()),
-            client_key: Some(key_path.clone()),
-            ..tak_bench_core::config::TlsConfig::default()
-        };
-        assert!(
-            connection::connect(
-                &tak_bench_core::config::TargetConfig {
-                    server: address.to_string(),
-                    sni: Some("example.test".into())
-                },
-                &tls,
-                &tak_bench_core::config::TimeoutConfig::default()
-            )
-            .await
-            .is_ok()
+        let authority = TestAuthority::new("test-ca");
+        let (server, server_key) = authority.issue("example.test");
+        let (client, client_key) = authority.issue("client.test");
+        let (address, task) = tls_server(server_config(
+            &server,
+            &server_key,
+            Some(&authority.certificate),
+        ))
+        .await;
+        let mut files = TempPemFiles::default();
+        let tls = client_tls(
+            &mut files,
+            &authority.certificate,
+            Some((&client, &client_key)),
         );
-        for path in [ca_path, cert_path, key_path] {
-            let _ = std::fs::remove_file(path);
-        }
-        task.await.unwrap();
+        let connected = connection::connect(
+            &tls_target(address, "example.test"),
+            &tls,
+            &tak_bench_core::config::TimeoutConfig::default(),
+        )
+        .await
+        .is_ok();
+        assert!(connected);
+        assert!(task.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn mtls_rejects_a_client_without_a_certificate() {
+        let authority = TestAuthority::new("trusted-ca");
+        let (server, server_key) = authority.issue("example.test");
+        let (address, task) = tls_server(server_config(
+            &server,
+            &server_key,
+            Some(&authority.certificate),
+        ))
+        .await;
+        let mut files = TempPemFiles::default();
+        let tls = client_tls(&mut files, &authority.certificate, None);
+        let _client_result = connection::connect(
+            &tls_target(address, "example.test"),
+            &tls,
+            &tak_bench_core::config::TimeoutConfig::default(),
+        )
+        .await;
+        assert!(!task.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn mtls_rejects_a_client_signed_by_an_untrusted_ca() {
+        let trusted = TestAuthority::new("trusted-ca");
+        let untrusted = TestAuthority::new("untrusted-ca");
+        let (server, server_key) = trusted.issue("example.test");
+        let (client, client_key) = untrusted.issue("client.test");
+        let (address, task) = tls_server(server_config(
+            &server,
+            &server_key,
+            Some(&trusted.certificate),
+        ))
+        .await;
+        let mut files = TempPemFiles::default();
+        let tls = client_tls(
+            &mut files,
+            &trusted.certificate,
+            Some((&client, &client_key)),
+        );
+        let _client_result = connection::connect(
+            &tls_target(address, "example.test"),
+            &tls,
+            &tak_bench_core::config::TimeoutConfig::default(),
+        )
+        .await;
+        assert!(!task.await.unwrap());
     }
 
     #[tokio::test]
@@ -767,6 +945,356 @@ mod tests {
         assert!(metrics.received_messages.load(Ordering::Relaxed) > 0);
         assert_eq!(accepted.load(Ordering::Relaxed), 2);
         server.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_reader_does_not_block_other_participants() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn(relay(listener, Arc::clone(&accepted)));
+        let mut config = loopback_config(address);
+        config.run.duration = std::time::Duration::from_secs(3);
+        config.run.gps_interval = std::time::Duration::from_secs(1);
+        config.timeouts.read = std::time::Duration::from_secs(5);
+        config.timeouts.write = std::time::Duration::from_secs(1);
+        config.scheduler = SchedulerConfig {
+            strategy: RampStrategy::Step,
+            steps: vec![
+                RampStep {
+                    at: std::time::Duration::ZERO,
+                    clients: 2,
+                },
+                RampStep {
+                    at: std::time::Duration::from_millis(100),
+                    clients: 3,
+                },
+            ],
+            ..SchedulerConfig::default()
+        };
+        config.participants = vec![
+            ParticipantConfig {
+                id: "slow-reader".into(),
+                role: ParticipantRole::ReceiveOnly,
+                pause_read_for: Some(std::time::Duration::from_secs(4)),
+                ..ParticipantConfig::default()
+            },
+            ParticipantConfig {
+                id: "fast-reader".into(),
+                role: ParticipantRole::ReceiveOnly,
+                ..ParticipantConfig::default()
+            },
+            ParticipantConfig {
+                id: "sender".into(),
+                role: ParticipantRole::SendOnly,
+                ..ParticipantConfig::default()
+            },
+        ];
+        let metrics = Arc::new(Metrics::new());
+        let (_stop_tx, stop) = watch::channel(false);
+        run_fixed_positions(config, Arc::clone(&metrics), stop)
+            .await
+            .unwrap();
+        assert!(metrics.sent_messages.load(Ordering::Relaxed) > 0);
+        assert!(metrics.received_messages.load(Ordering::Relaxed) > 0);
+        assert_eq!(accepted.load(Ordering::Relaxed), 3);
+        server.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_first_write_is_bounded_and_cancelled_by_watch() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let (payload_tx, mut payload_rx) = mpsc::channel(1);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = accepted_tx.send(());
+            let mut buffer = [0_u8; 1024];
+            let count = stream.read(&mut buffer).await.unwrap();
+            let _ = payload_tx.send(count).await;
+        });
+        let mut config = loopback_config(address);
+        config.run.duration = std::time::Duration::from_secs(5);
+        config.run.gps_interval = std::time::Duration::from_secs(1);
+        config.timeouts.write = std::time::Duration::from_secs(2);
+        config.scenario.slow_connect = SlowConnectConfig {
+            enabled: true,
+            initial_write_delay: std::time::Duration::from_secs(2),
+        };
+        config.participants = vec![ParticipantConfig {
+            id: "delayed".into(),
+            role: ParticipantRole::SendOnly,
+            ..ParticipantConfig::default()
+        }];
+        let metrics = Arc::new(Metrics::new());
+        let (stop_tx, stop) = watch::channel(false);
+        let runner = tokio::spawn(run_fixed_positions(config, Arc::clone(&metrics), stop));
+        accepted_rx.await.unwrap();
+        wait_for_connections(&metrics, 1).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_millis(1_999)).await;
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            payload_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_millis(999)).await;
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            payload_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        tokio::select! {
+            count = payload_rx.recv() => assert!(count.is_some_and(|count| count > 0)),
+            () = tokio::time::sleep(std::time::Duration::from_millis(500)) => panic!("first write exceeded its configured bound"),
+        }
+        stop_tx.send(true).unwrap();
+        assert!(runner.await.unwrap().is_ok());
+        server.await.unwrap();
+        assert_eq!(metrics.sent_messages.load(Ordering::Relaxed), 1);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = accepted_tx.send(());
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+            received
+        });
+        let mut config = loopback_config(address);
+        config.run.duration = std::time::Duration::from_secs(60);
+        config.scenario.slow_connect = SlowConnectConfig {
+            enabled: true,
+            initial_write_delay: std::time::Duration::from_secs(30),
+        };
+        config.participants = vec![ParticipantConfig {
+            id: "cancelled".into(),
+            role: ParticipantRole::SendOnly,
+            ..ParticipantConfig::default()
+        }];
+        let (stop_tx, stop) = watch::channel(false);
+        let runner = tokio::spawn(run_fixed_positions(config, Arc::new(Metrics::new()), stop));
+        accepted_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        stop_tx.send(true).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), runner)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_ok());
+        assert!(server.await.unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_first_write_stops_at_the_run_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+            received
+        });
+        let mut config = loopback_config(address);
+        config.run.duration = std::time::Duration::from_secs(1);
+        config.scenario.slow_connect = SlowConnectConfig {
+            enabled: true,
+            initial_write_delay: std::time::Duration::from_secs(30),
+        };
+        config.participants = vec![ParticipantConfig {
+            id: "deadline".into(),
+            role: ParticipantRole::SendOnly,
+            ..ParticipantConfig::default()
+        }];
+        let (_stop_tx, stop) = watch::channel(false);
+        assert!(
+            run_fixed_positions(config, Arc::new(Metrics::new()), stop)
+                .await
+                .is_ok()
+        );
+        assert!(server.await.unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn abrupt_disconnect_isolated_and_reconnects_stop_at_max_attempts() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let (first_closed_tx, first_closed_rx) = oneshot::channel();
+        let (stable_ready_tx, stable_ready_rx) = oneshot::channel();
+        let (direction_tx, mut direction_rx) = mpsc::channel(2);
+        let server = tokio::spawn(abrupt_disconnect_server(
+            listener,
+            Arc::clone(&accepted),
+            first_closed_tx,
+            stable_ready_tx,
+            direction_tx,
+            2,
+        ));
+
+        let mut config = loopback_config(address);
+        config.run.duration = std::time::Duration::from_secs(4);
+        config.run.gps_interval = std::time::Duration::from_secs(1);
+        config.timeouts.read = std::time::Duration::from_secs(5);
+        config.reconnect = ReconnectConfig {
+            enabled: true,
+            min_backoff: std::time::Duration::from_secs(1),
+            max_backoff: std::time::Duration::from_secs(1),
+            max_attempts: 2,
+            jitter_percent: 0,
+        };
+        let metrics = Arc::new(Metrics::new());
+        let ledger = Arc::new(Mutex::new(CorrelationLedger::default()));
+        let (_stop_tx, stop) = watch::channel(false);
+        let deadline = tokio::time::Instant::now() + config.run.duration;
+        let flaky_config = config.clone();
+        let flaky_metrics = Arc::clone(&metrics);
+        let flaky_ledger = Arc::clone(&ledger);
+        let flaky_stop = stop.clone();
+        let flaky = tokio::spawn(async move {
+            run_participant(
+                ParticipantConfig {
+                    id: "flaky".into(),
+                    ..ParticipantConfig::default()
+                },
+                flaky_config,
+                flaky_metrics,
+                flaky_ledger,
+                flaky_stop,
+                deadline,
+            )
+            .await
+        });
+        first_closed_rx.await.unwrap();
+
+        let stable_a_config = config.clone();
+        let stable_a_metrics = Arc::clone(&metrics);
+        let stable_a_ledger = Arc::clone(&ledger);
+        let stable_a_stop = stop.clone();
+        let stable_a = tokio::spawn(async move {
+            run_participant(
+                ParticipantConfig {
+                    id: "stable-a".into(),
+                    ..ParticipantConfig::default()
+                },
+                stable_a_config,
+                stable_a_metrics,
+                stable_a_ledger,
+                stable_a_stop,
+                deadline,
+            )
+            .await
+        });
+        let stable_b = tokio::spawn(run_participant(
+            ParticipantConfig {
+                id: "stable-b".into(),
+                ..ParticipantConfig::default()
+            },
+            config,
+            Arc::clone(&metrics),
+            Arc::clone(&ledger),
+            stop,
+            deadline,
+        ));
+        stable_ready_rx.await.unwrap();
+
+        let mut directions = [false; 2];
+        while !directions.iter().all(|observed| *observed) {
+            let direction = direction_rx.recv().await.unwrap();
+            directions[direction] = true;
+        }
+        let (flaky, stable_a, stable_b) = tokio::join!(flaky, stable_a, stable_b);
+        assert!(flaky.unwrap().is_err());
+        assert!(stable_a.unwrap().is_ok());
+        assert!(stable_b.unwrap().is_ok());
+        server.await.unwrap();
+        assert_eq!(accepted.load(Ordering::Relaxed), 5);
+        assert_eq!(metrics.connection_attempts.load(Ordering::Relaxed), 5);
+        assert_eq!(metrics.reconnects.load(Ordering::Relaxed), 2);
+        assert!(metrics.received_messages.load(Ordering::Relaxed) >= 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn invalid_payload_kinds_are_bounded_against_a_loopback_fixture() {
+        let kinds = [
+            InvalidEventKind::MalformedXml,
+            InvalidEventKind::UnterminatedXml,
+            InvalidEventKind::OversizedFrame,
+            InvalidEventKind::InvalidCoordinates,
+            InvalidEventKind::InvalidTime,
+        ];
+        for kind in kinds {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (accepted_tx, accepted_rx) = oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let _ = accepted_tx.send(());
+                let mut received = Vec::new();
+                stream.read_to_end(&mut received).await.unwrap();
+                received
+            });
+            let mut config = loopback_config(address);
+            config.environment = Environment::Local;
+            config.run.duration = std::time::Duration::from_millis(3_100);
+            config.run.gps_interval = std::time::Duration::from_secs(1);
+            config.run.max_rate = Some(1.0);
+            config.timeouts.write = std::time::Duration::from_secs(60);
+            config.participants = vec![ParticipantConfig {
+                id: "invalid-sender".into(),
+                role: ParticipantRole::SendOnly,
+                ..ParticipantConfig::default()
+            }];
+            config.scenario.invalid = InvalidScenarioConfig {
+                enabled: true,
+                kind: Some(kind),
+                max_events: Some(2),
+            };
+            assert!(safety::validate(&config, false).is_ok());
+            let expected_invalid = invalid_or_position(&config.participants[0], &config, 0)
+                .unwrap()
+                .into_bytes();
+            assert!(invalid_or_position(&config.participants[0], &config, 1).is_some());
+            assert!(invalid_or_position(&config.participants[0], &config, 2).is_none());
+
+            let metrics = Arc::new(Metrics::new());
+            let (_stop_tx, stop) = watch::channel(false);
+            let runner = tokio::spawn(run_fixed_positions(config, Arc::clone(&metrics), stop));
+            accepted_rx.await.unwrap();
+            wait_for_connections(&metrics, 1).await;
+            tokio::task::yield_now().await;
+            tokio::time::advance(std::time::Duration::from_millis(999)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(metrics.sent_messages.load(Ordering::Relaxed), 0);
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
+            wait_for_sent(&metrics, 1).await;
+            tokio::time::advance(std::time::Duration::from_millis(999)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(metrics.sent_messages.load(Ordering::Relaxed), 1);
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
+            wait_for_sent(&metrics, 2).await;
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            wait_for_sent(&metrics, 3).await;
+            tokio::time::advance(std::time::Duration::from_millis(100)).await;
+            assert!(runner.await.unwrap().is_ok());
+            let received = server.await.unwrap();
+            let invalid_bytes = expected_invalid.len();
+            assert!(received.len() > invalid_bytes * 2);
+            assert_eq!(&received[..invalid_bytes], expected_invalid.as_slice());
+            assert_eq!(
+                &received[invalid_bytes..invalid_bytes * 2],
+                expected_invalid.as_slice()
+            );
+            let valid = String::from_utf8(received[invalid_bytes * 2..].to_vec()).unwrap();
+            assert!(inspect_event(valid).is_ok());
+            assert_eq!(metrics.sent_messages.load(Ordering::Relaxed), 3);
+        }
     }
 
     #[tokio::test]
