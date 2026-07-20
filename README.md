@@ -32,13 +32,16 @@ A YAML configuration can define TLS/mTLS, participant roles, ramp-up, timeouts, 
 ## Current capabilities
 
 - Fixed-position CoT events with a UID and per-event correlation ID.
-- TCP, TLS, and mTLS with hostname verification always enabled.
+- TCP, TLS, and mTLS with hostname verification always enabled, including optional
+  per-participant certificate/key path templates using `{participant_id}`.
 - Concurrent reading and writing, received/duplicate message counts, and local delivery latency when the correlation extension is preserved.
 - `immediate`, `linear`, `step`, and `randomized` ramps; connection, message, latency, and drop thresholds that cooperatively stop a run.
 - Participant roles (`send_only`, `receive_only`, and `send_receive`), bounded reconnect with jitter, per-operation timeouts, CoT batching and fragmentation.
 - Observational routing assertions: sender correlations must arrive at named receivers and not at forbidden receivers; the harness does not configure server routing.
 - Terminal and JSON reports with final status, abort reason, sanitized configuration, metrics, and assertion results.
 - A server-neutral `Provisioner` interface and `FakeProvisioner` for tests; no Vanguarda-specific or other server-specific API is embedded.
+- A reusable `tak-bench-runner` crate so external integrations can provision their own
+  fixtures and execute the same guarded workload lifecycle as the CLI.
 
 ## Development
 

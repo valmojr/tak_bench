@@ -164,6 +164,10 @@ async fn run_participant(
     mut stop: watch::Receiver<bool>,
     deadline: tokio::time::Instant,
 ) -> Result<()> {
+    let participant_tls = config
+        .tls
+        .for_participant(&participant.id)
+        .map_err(anyhow::Error::from)?;
     let mut attempt = 0_u32;
     let recovery_started = Instant::now();
     loop {
@@ -171,7 +175,7 @@ async fn run_participant(
             return Ok(());
         }
         metrics.connection_attempts.fetch_add(1, Ordering::Relaxed);
-        let connect = connection::connect(&config.target, &config.tls, &config.timeouts);
+        let connect = connection::connect(&config.target, &participant_tls, &config.timeouts);
         let connection_result = tokio::select! {
             result = connect => result,
             () = wait_for_stop(&mut stop) => return Ok(()),

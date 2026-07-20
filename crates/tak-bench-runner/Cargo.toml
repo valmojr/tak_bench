@@ -1,5 +1,5 @@
 [package]
-name = "tak-bench-cli"
+name = "tak-bench-runner"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,24 +8,16 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
-description = "Authorized, server-neutral TAK/CoT transport benchmark CLI"
+description = "Reusable execution lifecycle for server-neutral TAK Bench workloads"
 publish = false
-
-[[bin]]
-name = "tak-bench"
-path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-clap.workspace = true
-serde_yaml.workspace = true
 tak-bench-core = { version = "0.1.0", path = "../tak-bench-core" }
 tak-bench-report = { version = "0.1.0", path = "../tak-bench-report" }
-tak-bench-runner = { version = "0.1.0", path = "../tak-bench-runner" }
 tak-bench-scenarios = { version = "0.1.0", path = "../tak-bench-scenarios" }
 time.workspace = true
 tokio.workspace = true
-tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

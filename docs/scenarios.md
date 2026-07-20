@@ -8,4 +8,4 @@ Profiles classify reports and select environment guardrails; participant counts,
 
 Invalid payloads are opt-in, bounded by `max_events`, rate-limited to one attempt per second, and blocked in production. Supported cases are malformed XML, unterminated XML, over-sized frame, invalid coordinates, and invalid time.
 
-The current runner implements only fixed-position workloads. Marker, chat, non-fixed movement, ramp-down and certificate-path templates are rejected during validation rather than silently falling back to another behavior. `max_rate`, when present, lengthens the emission interval and never increases the configured GPS cadence.
+The current runner implements only fixed-position workloads. Marker, chat, non-fixed movement and ramp-down are rejected during validation rather than silently falling back to another behavior. Certificate-path templates are supported for distinct participant mTLS identities. `max_rate`, when present, lengthens the emission interval and never increases the configured GPS cadence.

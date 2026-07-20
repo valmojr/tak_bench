@@ -107,6 +107,61 @@ pub struct TlsConfig {
     pub client_key_template: Option<String>,
 }
 
+impl TlsConfig {
+    /// Resolves optional per-participant certificate templates without changing the shared CA.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when templates are incomplete, ambiguous, missing the placeholder, or
+    /// the participant ID is unsafe to interpolate into a path.
+    pub fn for_participant(&self, participant_id: &str) -> Result<Self, TlsTemplateError> {
+        match (&self.client_cert_template, &self.client_key_template) {
+            (None, None) => Ok(self.clone()),
+            (Some(cert_template), Some(key_template)) => {
+                if self.client_cert.is_some()
+                    || self.client_key.is_some()
+                    || !cert_template.contains("{participant_id}")
+                    || !key_template.contains("{participant_id}")
+                    || !is_safe_participant_id(participant_id)
+                {
+                    return Err(TlsTemplateError);
+                }
+                let mut resolved = self.clone();
+                resolved.client_cert = Some(PathBuf::from(
+                    cert_template.replace("{participant_id}", participant_id),
+                ));
+                resolved.client_key = Some(PathBuf::from(
+                    key_template.replace("{participant_id}", participant_id),
+                ));
+                resolved.client_cert_template = None;
+                resolved.client_key_template = None;
+                Ok(resolved)
+            }
+            _ => Err(TlsTemplateError),
+        }
+    }
+
+    #[must_use]
+    pub fn uses_participant_templates(&self) -> bool {
+        self.client_cert_template.is_some() || self.client_key_template.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+#[error(
+    "TLS participant templates must be a complete, unambiguous pair containing {{participant_id}} and using a safe participant ID"
+)]
+pub struct TlsTemplateError;
+
+fn is_safe_participant_id(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        && value != "."
+        && value != ".."
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RunConfig {
@@ -434,4 +489,64 @@ pub fn host_from_server(server: &str) -> &str {
 #[must_use]
 pub fn is_loopback(host: &str) -> bool {
     host == "localhost" || IpAddr::from_str(host).is_ok_and(|address| address.is_loopback())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn participant_tls_templates_resolve_as_a_safe_pair() {
+        let tls = TlsConfig {
+            enabled: true,
+            ca: Some(PathBuf::from("ca.pem")),
+            client_cert_template: Some("credentials/{participant_id}/client.pem".into()),
+            client_key_template: Some("credentials/{participant_id}/client-key.pem".into()),
+            ..TlsConfig::default()
+        };
+
+        let resolved = tls.for_participant("receiver-1").unwrap();
+        assert_eq!(
+            resolved.client_cert,
+            Some(PathBuf::from("credentials/receiver-1/client.pem"))
+        );
+        assert_eq!(
+            resolved.client_key,
+            Some(PathBuf::from("credentials/receiver-1/client-key.pem"))
+        );
+        assert!(!resolved.uses_participant_templates());
+    }
+
+    #[test]
+    fn participant_tls_templates_reject_ambiguous_or_unsafe_inputs() {
+        let incomplete = TlsConfig {
+            client_cert_template: Some("{participant_id}.pem".into()),
+            ..TlsConfig::default()
+        };
+        assert!(matches!(
+            incomplete.for_participant("client-1"),
+            Err(TlsTemplateError)
+        ));
+
+        let ambiguous = TlsConfig {
+            client_cert: Some(PathBuf::from("shared.pem")),
+            client_cert_template: Some("{participant_id}.pem".into()),
+            client_key_template: Some("{participant_id}.key".into()),
+            ..TlsConfig::default()
+        };
+        assert!(matches!(
+            ambiguous.for_participant("client-1"),
+            Err(TlsTemplateError)
+        ));
+
+        let templates = TlsConfig {
+            client_cert_template: Some("{participant_id}.pem".into()),
+            client_key_template: Some("{participant_id}.key".into()),
+            ..TlsConfig::default()
+        };
+        assert!(matches!(
+            templates.for_participant("../escape"),
+            Err(TlsTemplateError)
+        ));
+    }
 }
