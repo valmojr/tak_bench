@@ -32,7 +32,9 @@ pub enum SafetyError {
     InvalidEventsNotAllowed,
     #[error("invalid event scenarios require max_events and are limited to one event per second")]
     InvalidEventLimit,
-    #[error("slow-client and slow-connect scenarios are not permitted in production")]
+    #[error(
+        "slow-client, slow-connect, and abrupt-disconnect scenarios are not permitted in production"
+    )]
     SlowClientNotAllowed,
 }
 
@@ -110,6 +112,7 @@ pub fn validate_with_options(
     }
     if config.environment == Environment::Production
         && (config.scenario.slow_connect.enabled
+            || config.scenario.abrupt_disconnect.enabled
             || config.participants.iter().any(|participant| {
                 participant.read_delay.is_some() || participant.pause_read_for.is_some()
             }))
@@ -161,6 +164,37 @@ mod tests {
         assert_eq!(
             validate(&config, false),
             Err(SafetyError::InvalidEventLimit)
+        );
+    }
+
+    #[test]
+    fn abrupt_disconnect_is_blocked_in_production() {
+        let config = AppConfig {
+            environment: Environment::Production,
+            authorization: crate::config::AuthorizationConfig { acknowledged: true },
+            allow_hosts: vec!["example.test".into()],
+            target: crate::config::TargetConfig {
+                server: "example.test:8089".into(),
+                sni: None,
+            },
+            scenario: crate::config::ScenarioConfig {
+                abrupt_disconnect: crate::config::AbruptDisconnectConfig {
+                    enabled: true,
+                    after_events: 1,
+                },
+                ..crate::config::ScenarioConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            validate_with_options(
+                &config,
+                SafetyOptions {
+                    allow_production: true,
+                    allow_invalid_events: false
+                }
+            ),
+            Err(SafetyError::SlowClientNotAllowed)
         );
     }
 }

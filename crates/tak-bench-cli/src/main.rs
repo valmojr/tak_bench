@@ -116,7 +116,9 @@ async fn main() -> Result<()> {
         Command::Scenario {
             command: ScenarioCommand::List,
         } => {
-            println!("position (fixed)\nfuture: marker, chat, route, groups, invalid, slow-client");
+            println!(
+                "position (fixed)\navailable controls: participants, routing assertions, fragmentation, reconnect, invalid inputs, slow-client, abrupt-disconnect\nfuture: marker, chat, route"
+            );
             Ok(())
         }
         Command::Certs {

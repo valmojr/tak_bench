@@ -207,7 +207,7 @@ async fn run_connected(
     let read_timeout = config.timeouts.read;
     let reader_metrics = Arc::clone(&metrics);
     let reader_ledger = Arc::clone(&ledger);
-    let reader_task = tokio::spawn(async move {
+    let mut reader_task = tokio::spawn(async move {
         read_events(
             &reader_participant,
             reader,
@@ -219,7 +219,7 @@ async fn run_connected(
         )
         .await
     });
-    let sent = send_positions(
+    let mut sender = std::pin::pin!(send_positions(
         participant,
         config,
         &metrics,
@@ -227,11 +227,13 @@ async fn run_connected(
         &mut writer,
         &mut stop,
         deadline,
-    )
-    .await;
-    reader_task.abort();
-    let _ = reader_task.await;
-    sent
+    ));
+    tokio::select! {
+        sent = &mut sender => { reader_task.abort(); let _ = reader_task.await; sent }
+        read = &mut reader_task => {
+            read.map_err(|error| anyhow::anyhow!("reader task failed: {error}"))?
+        }
+    }
 }
 
 async fn read_events(
@@ -254,7 +256,7 @@ async fn read_events(
             () = tokio::time::sleep_until(deadline) => return Ok(()),
             result = tokio::time::timeout(read_timeout, reader.read(&mut buffer)) => {
                 let count = result.map_err(|_| anyhow::anyhow!("read timed out"))??;
-                if count == 0 { return Ok(()); }
+                if count == 0 { bail!("peer closed the connection before the run deadline"); }
                 if let Some(delay) = participant.read_delay { tokio::time::sleep(delay).await; }
                 for raw in decoder.push(&buffer[..count])? {
                     let event = inspect_event(raw)?; metrics.received_messages.fetch_add(1, Ordering::Relaxed);
@@ -452,7 +454,165 @@ pub fn minimum_stale_interval(interval: std::time::Duration) -> std::time::Durat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
     use tak_bench_core::config::{ReconnectConfig, RoutingAssertion};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    fn loopback_config(address: std::net::SocketAddr) -> AppConfig {
+        AppConfig {
+            authorization: tak_bench_core::config::AuthorizationConfig { acknowledged: true },
+            target: tak_bench_core::config::TargetConfig {
+                server: address.to_string(),
+                sni: None,
+            },
+            run: tak_bench_core::config::RunConfig {
+                clients: 1,
+                max_clients: 3,
+                duration: std::time::Duration::from_millis(500),
+                gps_interval: std::time::Duration::from_millis(30),
+                ..tak_bench_core::config::RunConfig::default()
+            },
+            timeouts: tak_bench_core::config::TimeoutConfig {
+                connect: std::time::Duration::from_millis(50),
+                tls_handshake: std::time::Duration::from_millis(50),
+                read: std::time::Duration::from_millis(300),
+                write: std::time::Duration::from_millis(50),
+            },
+            ..AppConfig::default()
+        }
+    }
+
+    async fn relay(listener: TcpListener, accepted: Arc<AtomicUsize>) {
+        let (tx, _) = tokio::sync::broadcast::channel::<(usize, Vec<u8>)>(32);
+        let mut next = 0;
+        while let Ok((stream, _)) = listener.accept().await {
+            let id = next;
+            next += 1;
+            accepted.fetch_add(1, Ordering::Relaxed);
+            let (mut read, mut write) = tokio::io::split(stream);
+            let sender = tx.clone();
+            let mut receiver = tx.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    match receiver.recv().await {
+                        Ok((source, bytes)) if source != id => {
+                            if write.write_all(&bytes).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            });
+            tokio::spawn(async move {
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    match read.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => {
+                            let _ = sender.send((id, buffer[..count].to_vec()));
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_roles_routing_and_fragmented_batches_work_end_to_end() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn(relay(listener, Arc::clone(&accepted)));
+        let mut config = loopback_config(address);
+        config.participants = vec![
+            ParticipantConfig {
+                id: "sender".into(),
+                role: ParticipantRole::SendOnly,
+                ..ParticipantConfig::default()
+            },
+            ParticipantConfig {
+                id: "receiver".into(),
+                role: ParticipantRole::ReceiveOnly,
+                ..ParticipantConfig::default()
+            },
+        ];
+        config.scenario.fragmentation.chunk_sizes = vec![3, 7, 11];
+        config.scenario.fragmentation.events_per_write = 2;
+        config.scenario.routing = vec![RoutingAssertion {
+            sender: "sender".into(),
+            receivers: vec!["receiver".into()],
+            forbidden_receivers: vec![],
+            timeout: Some(std::time::Duration::from_secs(1)),
+        }];
+        let metrics = Arc::new(Metrics::new());
+        let (_stop_tx, stop) = watch::channel(false);
+        let outcome = run_fixed_positions(config, Arc::clone(&metrics), stop)
+            .await
+            .unwrap();
+        assert!(outcome.assertions[0].passed);
+        assert!(metrics.received_messages.load(Ordering::Relaxed) > 0);
+        assert_eq!(accepted.load(Ordering::Relaxed), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn eof_triggers_bounded_reconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (first, _) = listener.accept().await.unwrap();
+            drop(first);
+            let (_second, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+        let mut config = loopback_config(address);
+        config.participants = vec![ParticipantConfig {
+            id: "receiver".into(),
+            role: ParticipantRole::ReceiveOnly,
+            ..ParticipantConfig::default()
+        }];
+        config.reconnect = ReconnectConfig {
+            enabled: true,
+            min_backoff: std::time::Duration::from_millis(1),
+            max_backoff: std::time::Duration::from_millis(2),
+            max_attempts: 2,
+            jitter_percent: 0,
+        };
+        let metrics = Arc::new(Metrics::new());
+        let (_stop_tx, stop) = watch::channel(false);
+        let _ = run_fixed_positions(config, Arc::clone(&metrics), stop).await;
+        assert!(metrics.reconnects.load(Ordering::Relaxed) >= 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn read_timeout_is_reported_against_a_real_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+        let mut config = loopback_config(address);
+        config.timeouts.read = std::time::Duration::from_millis(40);
+        config.participants = vec![ParticipantConfig {
+            id: "receiver".into(),
+            role: ParticipantRole::ReceiveOnly,
+            ..ParticipantConfig::default()
+        }];
+        let (_stop_tx, stop) = watch::channel(false);
+        assert!(
+            run_fixed_positions(config, Arc::new(Metrics::new()), stop)
+                .await
+                .is_err()
+        );
+        server.abort();
+    }
 
     #[test]
     fn reconnect_backoff_is_bounded() {
