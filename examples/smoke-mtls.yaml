@@ -1,0 +1,12 @@
+version: 1
+authorization: { acknowledged: true }
+environment: production
+allow_hosts: [example.test]
+target: { server: example.test:8089, sni: example.test }
+tls:
+  enabled: true
+  ca: /replace/me/ca.pem
+  client_cert: /replace/me/client.pem
+  client_key: /replace/me/client-key.pem
+run: { profile: smoke, clients: 1, max_clients: 3, duration: 2m, gps_interval: 30s }
+scenario: { kind: position, movement: fixed }

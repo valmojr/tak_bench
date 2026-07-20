@@ -1,0 +1,14 @@
+version: 1
+authorization: { acknowledged: true }
+environment: local
+allow_hosts: [example.test]
+target: { server: example.test:8089 }
+run: { profile: functional, clients: 2, max_clients: 10, duration: 1m, gps_interval: 5s }
+participants:
+  - { id: sender, role: send_only }
+  - { id: receiver, role: receive_only }
+scenario:
+  kind: position
+  movement: fixed
+  routing:
+    - { sender: sender, receivers: [receiver], forbidden_receivers: [] }

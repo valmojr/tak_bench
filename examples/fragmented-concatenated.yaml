@@ -1,0 +1,9 @@
+version: 1
+authorization: { acknowledged: true }
+environment: local
+allow_hosts: [example.test]
+target: { server: example.test:8089 }
+run: { profile: functional, clients: 1, max_clients: 2, duration: 1m, gps_interval: 5s }
+scenario:
+  kind: position
+  fragmentation: { events_per_write: 3, chunk_sizes: [7, 13, 29] }

@@ -1,0 +1,9 @@
+version: 1
+authorization: { acknowledged: true }
+environment: local
+allow_hosts: [example.test]
+target: { server: example.test:8089 }
+run: { profile: stress, clients: 1, max_clients: 1, duration: 10s, gps_interval: 1s, max_rate: 1.0 }
+scenario:
+  kind: position
+  invalid: { enabled: true, kind: malformed_xml, max_events: 2 }

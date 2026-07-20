@@ -1,0 +1,10 @@
+version: 1
+authorization: { acknowledged: true }
+environment: local
+allow_hosts: [example.test]
+target: { server: example.test:8089 }
+run: { profile: stress, clients: 2, max_clients: 2, duration: 30s, gps_interval: 2s }
+participants:
+  - { id: sender, role: send_only }
+  - { id: slow-reader, role: receive_only, read_delay: 1s, pause_read_for: 2s }
+scenario: { kind: position, slow_connect: { enabled: true, initial_write_delay: 1s } }

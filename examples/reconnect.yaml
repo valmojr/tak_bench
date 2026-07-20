@@ -1,0 +1,8 @@
+version: 1
+authorization: { acknowledged: true }
+environment: staging
+allow_hosts: [example.test]
+target: { server: example.test:8089 }
+run: { profile: reconnect, clients: 2, max_clients: 10, duration: 2m, gps_interval: 5s }
+reconnect: { enabled: true, min_backoff: 1s, max_backoff: 10s, max_attempts: 3, jitter_percent: 10 }
+timeouts: { connect: 5s, tls_handshake: 5s, read: 10s, write: 5s }

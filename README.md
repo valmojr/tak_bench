@@ -27,7 +27,7 @@ cargo run -p tak-bench-cli -- smoke \
   --duration 2m
 ```
 
-A YAML configuration can define TLS/mTLS, ramp-up, thresholds, fragmentation, and JSON output. CLI flags override equivalent fields. Start with [functional.yaml](examples/functional.yaml).
+A YAML configuration can define TLS/mTLS, participant roles, ramp-up, timeouts, reconnect, routing observations, fragmentation, thresholds, and stable JSON output. CLI flags override equivalent fields. Start with [functional-routing.yaml](examples/functional-routing.yaml).
 
 ## Current capabilities
 
@@ -35,7 +35,9 @@ A YAML configuration can define TLS/mTLS, ramp-up, thresholds, fragmentation, an
 - TCP, TLS, and mTLS with hostname verification always enabled.
 - Concurrent reading and writing, received/duplicate message counts, and local delivery latency when the correlation extension is preserved.
 - `immediate`, `linear`, `step`, and `randomized` ramps; connection, message, latency, and drop thresholds that cooperatively stop a run.
-- Terminal and JSON reports, including handshake and delivery metrics plus the stop reason.
+- Participant roles (`send_only`, `receive_only`, and `send_receive`), bounded reconnect with jitter, per-operation timeouts, CoT batching and fragmentation.
+- Observational routing assertions: sender correlations must arrive at named receivers and not at forbidden receivers; the harness does not configure server routing.
+- Terminal and JSON reports with final status, abort reason, sanitized configuration, metrics, and assertion results.
 - A server-neutral `Provisioner` interface and `FakeProvisioner` for tests; no Vanguarda-specific or other server-specific API is embedded.
 
 ## Development
@@ -46,4 +48,4 @@ cargo clippy --workspace -- -D warnings
 cargo test --workspace
 ```
 
-Chat and marker scenarios, route/GeoJSON movement, reconnect execution, group routing assertions, test PKI, and the opt-in compatibility suite against an official TAK Server remain on the [roadmap](docs/roadmap.md).
+Slow local readers, bounded abrupt disconnects, bounded slow first writes, and carefully rate-limited invalid inputs are opt-in scenario controls. They are never production-safe. See [scenario guidance](docs/scenarios.md).

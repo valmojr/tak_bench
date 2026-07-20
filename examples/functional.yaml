@@ -3,9 +3,9 @@ authorization:
   acknowledged: true
 environment: local
 allow_hosts:
-  - 127.0.0.1
+  - example.test
 target:
-  server: 127.0.0.1:8089
+  server: example.test:8089
 run:
   profile: functional
   clients: 2
