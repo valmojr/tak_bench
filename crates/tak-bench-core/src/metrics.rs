@@ -16,9 +16,12 @@ pub struct Metrics {
     pub dropped_messages: AtomicU64,
     pub message_timeouts: AtomicU64,
     pub reconnects: AtomicU64,
+    pub reconnect_failures: AtomicU64,
+    pub local_dropped_messages: AtomicU64,
     pub active_connections: AtomicU64,
     handshake_us: Mutex<Histogram<u64>>,
     delivery_us: Mutex<Histogram<u64>>,
+    recovery_us: Mutex<Histogram<u64>>,
 }
 
 impl Default for Metrics {
@@ -34,11 +37,16 @@ impl Default for Metrics {
             dropped_messages: AtomicU64::new(0),
             message_timeouts: AtomicU64::new(0),
             reconnects: AtomicU64::new(0),
+            reconnect_failures: AtomicU64::new(0),
+            local_dropped_messages: AtomicU64::new(0),
             active_connections: AtomicU64::new(0),
             handshake_us: Mutex::new(
                 Histogram::new_with_bounds(1, 600_000_000, 3).expect("valid histogram bounds"),
             ),
             delivery_us: Mutex::new(
+                Histogram::new_with_bounds(1, 600_000_000, 3).expect("valid histogram bounds"),
+            ),
+            recovery_us: Mutex::new(
                 Histogram::new_with_bounds(1, 600_000_000, 3).expect("valid histogram bounds"),
             ),
         }
@@ -57,12 +65,15 @@ pub struct MetricsSnapshot {
     pub dropped_messages: u64,
     pub message_timeouts: u64,
     pub reconnects: u64,
+    pub reconnect_failures: u64,
+    pub local_dropped_messages: u64,
     pub active_connections: u64,
     pub handshake_p50_ms: Option<f64>,
     pub handshake_p95_ms: Option<f64>,
     pub delivery_p50_ms: Option<f64>,
     pub delivery_p95_ms: Option<f64>,
     pub delivery_p99_ms: Option<f64>,
+    pub recovery_p95_ms: Option<f64>,
 }
 
 impl Metrics {
@@ -82,9 +93,16 @@ impl Metrics {
             .max(1);
         let _ = self.delivery_us.lock().await.record(micros);
     }
+    pub async fn record_recovery(&self, elapsed: Duration) {
+        let micros = u64::try_from(elapsed.as_micros())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let _ = self.recovery_us.lock().await.record(micros);
+    }
     pub async fn snapshot(&self) -> MetricsSnapshot {
         let histogram = self.handshake_us.lock().await;
         let delivery = self.delivery_us.lock().await;
+        let recovery = self.recovery_us.lock().await;
         let percentile = |histogram: &Histogram<u64>, q| {
             if histogram.is_empty() {
                 None
@@ -106,12 +124,15 @@ impl Metrics {
             dropped_messages: self.dropped_messages.load(Ordering::Relaxed),
             message_timeouts: self.message_timeouts.load(Ordering::Relaxed),
             reconnects: self.reconnects.load(Ordering::Relaxed),
+            reconnect_failures: self.reconnect_failures.load(Ordering::Relaxed),
+            local_dropped_messages: self.local_dropped_messages.load(Ordering::Relaxed),
             active_connections: self.active_connections.load(Ordering::Relaxed),
             handshake_p50_ms: percentile(&histogram, 0.5),
             handshake_p95_ms: percentile(&histogram, 0.95),
             delivery_p50_ms: percentile(&delivery, 0.5),
             delivery_p95_ms: percentile(&delivery, 0.95),
             delivery_p99_ms: percentile(&delivery, 0.99),
+            recovery_p95_ms: percentile(&recovery, 0.95),
         }
     }
 }

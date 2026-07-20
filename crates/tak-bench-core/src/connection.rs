@@ -13,7 +13,7 @@ use tokio::{
 };
 use tokio_rustls::TlsConnector;
 
-use crate::config::{TargetConfig, TlsConfig};
+use crate::config::{TargetConfig, TimeoutConfig, TlsConfig};
 
 pub trait AsyncStream: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T> AsyncStream for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -47,19 +47,32 @@ impl ClientConnection {
 /// # Errors
 ///
 /// Returns an error when the stream cannot write or flush the payload.
-pub async fn write_all(writer: &mut ConnectionWriter, bytes: &[u8]) -> Result<()> {
-    writer.write_all(bytes).await.context("writing CoT event")?;
-    writer.flush().await.context("flushing CoT event")
+pub async fn write_all(
+    writer: &mut ConnectionWriter,
+    bytes: &[u8],
+    timeout: Duration,
+) -> Result<()> {
+    tokio::time::timeout(timeout, async {
+        writer.write_all(bytes).await.context("writing CoT event")?;
+        writer.flush().await.context("flushing CoT event")
+    })
+    .await
+    .context("write timed out")?
 }
 
 /// # Errors
 ///
 /// Returns an error for failed TCP/TLS connection, invalid certificate material,
 /// or TLS hostname verification failure.
-pub async fn connect(target: &TargetConfig, tls: &TlsConfig) -> Result<ClientConnection> {
+pub async fn connect(
+    target: &TargetConfig,
+    tls: &TlsConfig,
+    timeouts: &TimeoutConfig,
+) -> Result<ClientConnection> {
     let started = Instant::now();
-    let tcp = TcpStream::connect(&target.server)
+    let tcp = tokio::time::timeout(timeouts.connect, TcpStream::connect(&target.server))
         .await
+        .context("connect timed out")?
         .with_context(|| format!("connecting to {}", target.server))?;
     tcp.set_nodelay(true).context("enabling TCP_NODELAY")?;
     if !tls.enabled {
@@ -74,9 +87,9 @@ pub async fn connect(target: &TargetConfig, tls: &TlsConfig) -> Result<ClientCon
         .unwrap_or_else(|| crate::config::host_from_server(&target.server));
     let server_name = ServerName::try_from(sni.to_owned()).context("invalid TLS SNI hostname")?;
     let connector = TlsConnector::from(Arc::new(build_tls_config(tls)?));
-    let stream = connector
-        .connect(server_name, tcp)
+    let stream = tokio::time::timeout(timeouts.tls_handshake, connector.connect(server_name, tcp))
         .await
+        .context("TLS handshake timed out")?
         .context("TLS handshake failed")?;
     Ok(ClientConnection {
         stream: Box::new(stream),

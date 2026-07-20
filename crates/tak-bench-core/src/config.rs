@@ -67,6 +67,7 @@ pub struct AppConfig {
     pub run: RunConfig,
     pub scheduler: SchedulerConfig,
     pub reconnect: ReconnectConfig,
+    pub timeouts: TimeoutConfig,
     pub abort: AbortConfig,
     pub participants: Vec<ParticipantConfig>,
     pub scenario: ScenarioConfig,
@@ -173,6 +174,31 @@ pub struct ReconnectConfig {
     pub jitter_percent: u8,
 }
 
+/// Bounds for operations that can otherwise wait indefinitely on a peer.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TimeoutConfig {
+    #[serde(with = "duration_serde")]
+    pub connect: Duration,
+    #[serde(with = "duration_serde")]
+    pub tls_handshake: Duration,
+    #[serde(with = "duration_serde")]
+    pub read: Duration,
+    #[serde(with = "duration_serde")]
+    pub write: Duration,
+}
+
+impl Default for TimeoutConfig {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(10),
+            tls_handshake: Duration::from_secs(10),
+            read: Duration::from_secs(30),
+            write: Duration::from_secs(10),
+        }
+    }
+}
+
 impl Default for ReconnectConfig {
     fn default() -> Self {
         Self {
@@ -203,7 +229,12 @@ pub struct AbortConfig {
 pub struct ParticipantConfig {
     pub id: String,
     pub role: ParticipantRole,
-    pub groups: Vec<String>,
+    /// A local reader delay used only by the opt-in slow-client scenario.
+    #[serde(with = "optional_duration_serde")]
+    pub read_delay: Option<Duration>,
+    /// Stops local reads for a bounded interval; this never changes server policy.
+    #[serde(with = "optional_duration_serde")]
+    pub pause_read_for: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -236,6 +267,8 @@ pub struct ScenarioConfig {
     pub routing: Vec<RoutingAssertion>,
     pub fragmentation: FragmentationConfig,
     pub invalid: InvalidScenarioConfig,
+    pub slow_connect: SlowConnectConfig,
+    pub abrupt_disconnect: AbruptDisconnectConfig,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -289,8 +322,33 @@ impl Default for FragmentationConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct InvalidScenarioConfig {
     pub enabled: bool,
-    pub kind: Option<String>,
+    pub kind: Option<InvalidEventKind>,
     pub max_events: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InvalidEventKind {
+    MalformedXml,
+    UnterminatedXml,
+    OversizedFrame,
+    InvalidCoordinates,
+    InvalidTime,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SlowConnectConfig {
+    pub enabled: bool,
+    #[serde(with = "duration_serde")]
+    pub initial_write_delay: Duration,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AbruptDisconnectConfig {
+    pub enabled: bool,
+    pub after_events: u32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

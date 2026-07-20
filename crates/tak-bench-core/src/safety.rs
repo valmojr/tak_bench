@@ -32,6 +32,8 @@ pub enum SafetyError {
     InvalidEventsNotAllowed,
     #[error("invalid event scenarios require max_events and are limited to one event per second")]
     InvalidEventLimit,
+    #[error("slow-client and slow-connect scenarios are not permitted in production")]
+    SlowClientNotAllowed,
 }
 
 /// # Errors
@@ -101,9 +103,18 @@ pub fn validate_with_options(
         }
         if config.scenario.invalid.max_events.is_none()
             || config.run.max_rate.is_some_and(|rate| rate > 1.0)
+            || config.run.max_rate.is_none() && config.run.gps_interval < Duration::from_secs(1)
         {
             return Err(SafetyError::InvalidEventLimit);
         }
+    }
+    if config.environment == Environment::Production
+        && (config.scenario.slow_connect.enabled
+            || config.participants.iter().any(|participant| {
+                participant.read_delay.is_some() || participant.pause_read_for.is_some()
+            }))
+    {
+        return Err(SafetyError::SlowClientNotAllowed);
     }
     Ok(())
 }
@@ -126,6 +137,30 @@ mod tests {
         assert_eq!(
             validate(&config, false),
             Err(SafetyError::ProductionNotAllowed)
+        );
+    }
+
+    #[test]
+    fn invalid_events_need_a_bounded_rate() {
+        let config = AppConfig {
+            authorization: crate::config::AuthorizationConfig { acknowledged: true },
+            scenario: crate::config::ScenarioConfig {
+                invalid: crate::config::InvalidScenarioConfig {
+                    enabled: true,
+                    max_events: Some(1),
+                    ..crate::config::InvalidScenarioConfig::default()
+                },
+                ..crate::config::ScenarioConfig::default()
+            },
+            run: crate::config::RunConfig {
+                gps_interval: Duration::from_millis(500),
+                ..crate::config::RunConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            validate(&config, false),
+            Err(SafetyError::InvalidEventLimit)
         );
     }
 }

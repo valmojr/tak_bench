@@ -9,7 +9,7 @@ use tak_bench_core::{
     safety::{self, AUTHORIZATION_BANNER},
     thresholds,
 };
-use tak_bench_report::RunReport;
+use tak_bench_report::{RunReport, RunStatus};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -170,7 +170,7 @@ async fn validate(
             },
         )?;
         println!("{AUTHORIZATION_BANNER}");
-        let _ = connection::connect(&config.target, &config.tls).await?;
+        let _ = connection::connect(&config.target, &config.tls, &config.timeouts).await?;
         println!("Connection preflight succeeded.");
     } else {
         println!("Configuration is valid. Use --connect to perform a connection preflight.");
@@ -224,12 +224,26 @@ async fn run(args: RunArgs, forced_profile: Option<Profile>) -> Result<()> {
         tak_bench_scenarios::run_fixed_positions(config.clone(), Arc::clone(&metrics), stop_rx)
             .await;
     monitor.abort();
-    let stop_reason = if let Some(reason) = threshold_reason.lock().await.clone() {
+    let threshold = threshold_reason.lock().await.clone();
+    let assertions = outcome
+        .as_ref()
+        .map_or_else(|_| Vec::new(), |value| value.assertions.clone());
+    let assertions_failed = assertions.iter().any(|assertion| !assertion.passed);
+    let stop_reason = if let Some(reason) = threshold.clone() {
         reason
-    } else if outcome.is_ok() {
+    } else if outcome.is_ok() && !assertions_failed {
         "completed".to_owned()
+    } else if assertions_failed {
+        "routing_assertion_failed".to_owned()
     } else {
         "scenario_error".to_owned()
+    };
+    let status = if threshold.is_some() {
+        RunStatus::Aborted
+    } else if outcome.is_ok() && !assertions_failed {
+        RunStatus::Passed
+    } else {
+        RunStatus::Failed
     };
     let report = RunReport::new(
         &config,
@@ -237,12 +251,20 @@ async fn run(args: RunArgs, forced_profile: Option<Profile>) -> Result<()> {
         started.elapsed(),
         metrics.snapshot().await,
         stop_reason,
+        status,
+        assertions,
     );
     println!("{}", report.terminal());
     if let Some(path) = &config.output.json {
         report.write_json(path)?;
     }
-    outcome
+    outcome?;
+    if assertions_failed {
+        anyhow::bail!(
+            "one or more routing assertions failed (participant IDs and counts are in the report)"
+        );
+    }
+    Ok(())
 }
 
 fn read_config(path: &PathBuf) -> Result<AppConfig> {
