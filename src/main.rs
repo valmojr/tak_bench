@@ -2,7 +2,7 @@ use std::{path::PathBuf, str::FromStr};
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use tak_bench_core::{
+use tak_bench::{
     config::{AppConfig, Environment, Profile},
     connection,
     safety::{self, AUTHORIZATION_BANNER},
@@ -200,7 +200,7 @@ async fn run(args: RunArgs, forced_profile: Option<Profile>) -> Result<()> {
             let _ = signal_tx.send(true);
         }
     });
-    let execution = tak_bench_runner::execute(config.clone(), safety_options, stop_rx).await?;
+    let execution = tak_bench::runner::execute(config.clone(), safety_options, stop_rx).await?;
     println!("{}", execution.report.terminal());
     if let Some(path) = &config.output.json {
         execution.report.write_json(path)?;

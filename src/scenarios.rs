@@ -6,15 +6,15 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{Result, bail};
-use rand::Rng;
-use tak_bench_core::{
+use crate::protocol::{CotStreamDecoder, PositionEvent, inspect_event};
+use crate::{
     config::{AppConfig, InvalidEventKind, ParticipantConfig, ParticipantRole, RoutingAssertion},
     connection::{self, ConnectionReader, ConnectionWriter},
     metrics::Metrics,
     scheduler::start_delays,
 };
-use tak_bench_protocol::{CotStreamDecoder, PositionEvent, inspect_event};
+use anyhow::{Result, bail};
+use rand::Rng;
 use time::OffsetDateTime;
 use tokio::{
     io::AsyncReadExt,
@@ -55,7 +55,7 @@ pub async fn run_fixed_positions(
         config,
         metrics,
         stop,
-        tak_bench_core::safety::SafetyOptions::default(),
+        crate::safety::SafetyOptions::default(),
     )
     .await
 }
@@ -70,9 +70,9 @@ pub async fn run_fixed_positions_with_options(
     config: AppConfig,
     metrics: Arc<Metrics>,
     mut stop: watch::Receiver<bool>,
-    safety_options: tak_bench_core::safety::SafetyOptions,
+    safety_options: crate::safety::SafetyOptions,
 ) -> Result<ScenarioOutcome> {
-    tak_bench_core::safety::validate_with_options(&config, safety_options)?;
+    crate::safety::validate_with_options(&config, safety_options)?;
     let deadline = tokio::time::Instant::now() + config.run.duration;
     let participants = participants(&config);
     let delays = start_delays(
@@ -247,8 +247,8 @@ async fn run_participant(
 fn is_tls_failure(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
-            .downcast_ref::<tak_bench_core::connection::ConnectError>()
-            .is_some_and(tak_bench_core::connection::ConnectError::is_tls)
+            .downcast_ref::<crate::connection::ConnectError>()
+            .is_some_and(crate::connection::ConnectError::is_tls)
             || cause
                 .downcast_ref::<std::io::Error>()
                 .is_some_and(|error| error.kind() == std::io::ErrorKind::InvalidData)
@@ -676,6 +676,13 @@ pub fn minimum_stale_interval(interval: std::time::Duration) -> std::time::Durat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        config::{
+            AbruptDisconnectConfig, Environment, InvalidScenarioConfig, RampStep, RampStrategy,
+            ReconnectConfig, RoutingAssertion, SchedulerConfig, SlowConnectConfig,
+        },
+        safety,
+    };
     use rcgen::{BasicConstraints, Certificate, CertificateParams, IsCa, KeyPair};
     use rustls::{
         RootCertStore, ServerConfig,
@@ -683,13 +690,6 @@ mod tests {
         server::WebPkiClientVerifier,
     };
     use std::{path::PathBuf, sync::atomic::AtomicUsize};
-    use tak_bench_core::{
-        config::{
-            AbruptDisconnectConfig, Environment, InvalidScenarioConfig, RampStep, RampStrategy,
-            ReconnectConfig, RoutingAssertion, SchedulerConfig, SlowConnectConfig,
-        },
-        safety,
-    };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{
@@ -750,7 +750,7 @@ mod tests {
         files: &mut TempPemFiles,
         server_ca: &Certificate,
         identity: Option<(&Certificate, &KeyPair)>,
-    ) -> tak_bench_core::config::TlsConfig {
+    ) -> crate::config::TlsConfig {
         let ca = files.write("ca", server_ca.pem());
         let (client_cert, client_key) = identity.map_or((None, None), |(certificate, key)| {
             (
@@ -758,12 +758,12 @@ mod tests {
                 Some(files.write("client-key", key.serialize_pem())),
             )
         });
-        tak_bench_core::config::TlsConfig {
+        crate::config::TlsConfig {
             enabled: true,
             ca: Some(ca),
             client_cert,
             client_key,
-            ..tak_bench_core::config::TlsConfig::default()
+            ..crate::config::TlsConfig::default()
         }
     }
 
@@ -804,11 +804,8 @@ mod tests {
         (address, task)
     }
 
-    fn tls_target(
-        address: std::net::SocketAddr,
-        sni: &str,
-    ) -> tak_bench_core::config::TargetConfig {
-        tak_bench_core::config::TargetConfig {
+    fn tls_target(address: std::net::SocketAddr, sni: &str) -> crate::config::TargetConfig {
+        crate::config::TargetConfig {
             server: address.to_string(),
             sni: Some(sni.into()),
         }
@@ -816,19 +813,19 @@ mod tests {
 
     fn loopback_config(address: std::net::SocketAddr) -> AppConfig {
         AppConfig {
-            authorization: tak_bench_core::config::AuthorizationConfig { acknowledged: true },
-            target: tak_bench_core::config::TargetConfig {
+            authorization: crate::config::AuthorizationConfig { acknowledged: true },
+            target: crate::config::TargetConfig {
                 server: address.to_string(),
                 sni: None,
             },
-            run: tak_bench_core::config::RunConfig {
+            run: crate::config::RunConfig {
                 clients: 1,
                 max_clients: 3,
                 duration: std::time::Duration::from_millis(500),
                 gps_interval: std::time::Duration::from_millis(30),
-                ..tak_bench_core::config::RunConfig::default()
+                ..crate::config::RunConfig::default()
             },
-            timeouts: tak_bench_core::config::TimeoutConfig {
+            timeouts: crate::config::TimeoutConfig {
                 connect: std::time::Duration::from_millis(50),
                 tls_handshake: std::time::Duration::from_millis(50),
                 read: std::time::Duration::from_millis(300),
@@ -962,7 +959,7 @@ mod tests {
         let connected = connection::connect(
             &tls_target(address, "example.test"),
             &tls,
-            &tak_bench_core::config::TimeoutConfig::default(),
+            &crate::config::TimeoutConfig::default(),
         )
         .await
         .is_ok();
@@ -980,7 +977,7 @@ mod tests {
         let rejected = connection::connect(
             &tls_target(address, "wrong.test"),
             &tls,
-            &tak_bench_core::config::TimeoutConfig::default(),
+            &crate::config::TimeoutConfig::default(),
         )
         .await
         .is_err();
@@ -999,9 +996,9 @@ mod tests {
         let authority = TestAuthority::new("test-ca");
         let mut files = TempPemFiles::default();
         let tls = client_tls(&mut files, &authority.certificate, None);
-        let timeouts = tak_bench_core::config::TimeoutConfig {
+        let timeouts = crate::config::TimeoutConfig {
             tls_handshake: std::time::Duration::from_millis(10),
-            ..tak_bench_core::config::TimeoutConfig::default()
+            ..crate::config::TimeoutConfig::default()
         };
         assert!(
             connection::connect(&tls_target(address, "example.test"), &tls, &timeouts)
@@ -1031,7 +1028,7 @@ mod tests {
         let connected = connection::connect(
             &tls_target(address, "example.test"),
             &tls,
-            &tak_bench_core::config::TimeoutConfig::default(),
+            &crate::config::TimeoutConfig::default(),
         )
         .await
         .is_ok();
@@ -1054,7 +1051,7 @@ mod tests {
         let _client_result = connection::connect(
             &tls_target(address, "example.test"),
             &tls,
-            &tak_bench_core::config::TimeoutConfig::default(),
+            &crate::config::TimeoutConfig::default(),
         )
         .await;
         assert!(!task.await.unwrap());
@@ -1081,7 +1078,7 @@ mod tests {
         let _client_result = connection::connect(
             &tls_target(address, "example.test"),
             &tls,
-            &tak_bench_core::config::TimeoutConfig::default(),
+            &crate::config::TimeoutConfig::default(),
         )
         .await;
         assert!(!task.await.unwrap());
@@ -1782,9 +1779,9 @@ mod tests {
     #[test]
     fn default_participants_follow_client_count() {
         let config = AppConfig {
-            run: tak_bench_core::config::RunConfig {
+            run: crate::config::RunConfig {
                 clients: 2,
-                ..tak_bench_core::config::RunConfig::default()
+                ..crate::config::RunConfig::default()
             },
             ..AppConfig::default()
         };

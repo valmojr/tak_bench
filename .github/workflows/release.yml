@@ -42,9 +42,9 @@ jobs:
             exit 1
           fi
 
-          version="$(cargo metadata --format-version 1 --no-deps --locked | jq -r '.packages[] | select(.name == "tak-bench-cli") | .version')"
+          version="$(cargo metadata --format-version 1 --no-deps --locked | jq -r '.packages[] | select(.name == "tak-bench") | .version')"
           if [[ -z "$version" || "$version" == "null" ]]; then
-            echo "Could not read the tak-bench-cli version from Cargo metadata" >&2
+            echo "Could not read the tak-bench version from Cargo metadata" >&2
             exit 1
           fi
 
@@ -98,7 +98,7 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - name: Build tak-bench
-        run: cargo build --package tak-bench-cli --bin tak-bench --release --locked --target ${{ matrix.target }}
+        run: cargo build --bin tak-bench --release --locked --target ${{ matrix.target }}
 
       - name: Package Unix binary
         if: runner.os != 'Windows'
@@ -140,8 +140,8 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  publish-crates:
-    name: publish-crates-io
+  publish-crate:
+    name: publish-crate-io
     needs:
       - validate
       - build
@@ -153,7 +153,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.88.0"
-      - name: Publish crates in dependency order
+      - name: Publish tak-bench
         shell: bash
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
@@ -237,20 +237,14 @@ jobs:
             return 1
           }
 
-          publish_crate tak-bench-core
-          publish_crate tak-bench-protocol
-          publish_crate tak-bench-scenarios
-          publish_crate tak-bench-report
-          publish_crate tak-bench-runner
-          publish_crate tak-bench-cli
-          publish_crate tak-bench-test-support
+          publish_crate tak-bench
 
   publish:
     name: publish-github-release
     needs:
       - validate
       - build
-      - publish-crates
+      - publish-crate
     runs-on: ubuntu-24.04
     permissions:
       contents: write

@@ -2,14 +2,14 @@
 
 use std::{sync::Arc, time::Instant};
 
-use anyhow::{Result, anyhow};
-use tak_bench_core::{
+use crate::report::{RunReport, RunStatus};
+use crate::{
     config::AppConfig,
     metrics::Metrics,
     safety::{self, SafetyOptions},
     thresholds,
 };
-use tak_bench_report::{RunReport, RunStatus};
+use anyhow::{Result, anyhow};
 use tokio::sync::watch;
 
 /// A completed execution always carries a sanitized report, including failed scenarios.
@@ -77,7 +77,7 @@ pub async fn execute(
             }
         }
     });
-    let outcome = tak_bench_scenarios::run_fixed_positions_with_options(
+    let outcome = crate::scenarios::run_fixed_positions_with_options(
         config.clone(),
         Arc::clone(&metrics),
         threshold_rx,

@@ -1,11 +1,11 @@
-use anyhow::{Context, Result};
-use serde::Serialize;
-use std::{path::Path, time::Duration};
-use tak_bench_core::{
+use crate::scenarios::AssertionResult;
+use crate::{
     config::{AppConfig, Environment, Profile},
     metrics::MetricsSnapshot,
 };
-use tak_bench_scenarios::AssertionResult;
+use anyhow::{Context, Result};
+use serde::Serialize;
+use std::{path::Path, time::Duration};
 use time::OffsetDateTime;
 
 #[derive(Debug, Serialize)]

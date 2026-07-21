@@ -15,13 +15,13 @@ Invalid events are blocked by default. In staging they require `--allow-invalid-
 Validate a configuration without opening a connection:
 
 ```bash
-cargo run -p tak-bench-cli -- validate --config examples/functional.yaml
+cargo run -- validate --config examples/functional.yaml
 ```
 
 Run an explicitly authorized local TCP smoke test:
 
 ```bash
-cargo run -p tak-bench-cli -- smoke \
+cargo run -- smoke \
   --server 127.0.0.1:8089 \
   --acknowledge-authorization \
   --duration 2m
@@ -40,17 +40,17 @@ A YAML configuration can define TLS/mTLS, participant roles, ramp-up, timeouts, 
 - Observational routing assertions: sender correlations must arrive at named receivers and not at forbidden receivers; the harness does not configure server routing.
 - Terminal and JSON reports with final status, abort reason, sanitized configuration, metrics, and assertion results.
 - A server-neutral `Provisioner` interface and `FakeProvisioner` for tests; no Vanguarda-specific or other server-specific API is embedded.
-- A reusable `tak-bench-runner` crate so external integrations can provision their own
-  fixtures and execute the same guarded workload lifecycle as the CLI.
+- A reusable `tak_bench::runner` module so external integrations can provision their own
+  fixtures and execute the same guarded workload lifecycle as the CLI from one public crate.
 
 ## Development
 
 ```bash
 cargo fmt --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
-cargo build --workspace --release --locked
-cargo package --workspace --locked
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+cargo build --release --locked
+cargo package --locked
 ```
 
 Slow local readers, bounded abrupt disconnects, bounded slow first writes, and carefully rate-limited invalid inputs are opt-in scenario controls. They are never production-safe. See [scenario guidance](docs/scenarios.md).

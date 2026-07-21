@@ -47,7 +47,7 @@ jobs:
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
   test:
     name: test
@@ -62,7 +62,7 @@ jobs:
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
       - name: Run tests
-        run: cargo test --workspace --all-features --locked
+        run: cargo test --all-features --locked
 
   release-build:
     name: release-build
@@ -77,11 +77,9 @@ jobs:
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
       - name: Build the release profile
-        run: cargo build --workspace --release --locked
-      - name: Install current stable Cargo for workspace packaging
-        uses: dtolnay/rust-toolchain@stable
-      - name: Verify crate packages
-        run: cargo package --workspace --locked
+        run: cargo build --release --locked
+      - name: Verify the crate package
+        run: cargo package --locked
 
   audit:
     name: audit
