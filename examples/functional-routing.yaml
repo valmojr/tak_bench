@@ -4,6 +4,11 @@ environment: local
 allow_hosts: [example.test]
 target: { server: example.test:8089 }
 run: { profile: functional, clients: 3, max_clients: 10, duration: 1m, gps_interval: 5s }
+timeouts:
+  connect: 10s
+  tls_handshake: 10s
+  read: 2m
+  write: 10s
 participants:
   - { id: a1, role: send_only }
   - { id: a2, role: receive_only }

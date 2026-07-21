@@ -29,6 +29,8 @@ cargo run -- smoke \
 
 A YAML configuration can define TLS/mTLS, participant roles, ramp-up, timeouts, reconnect, readiness synchronization, routing observations, fragmentation, thresholds, and stable JSON output. CLI flags override equivalent fields. `--lifecycle-jsonl` (or `output.lifecycle_jsonl: true`) reserves stdout for sanitized orchestration events; the JSON report remains the primary artifact. Unsupported scenario and scheduling options are rejected before dialing. Start with [functional-routing.yaml](examples/functional-routing.yaml).
 
+External orchestrators should consume lifecycle JSON Lines as an ephemeral control stream rather than upload them as an artifact. Persist only `output.json`, validate routing by the individual `sender`, `receiver`, and `expectation` fields, and configure the read timeout longer than the overall functional run so the global scenario deadline owns silent-receiver completion.
+
 ## Current capabilities
 
 - Fixed-position CoT events with a UID and per-event correlation ID.
