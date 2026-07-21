@@ -6,7 +6,7 @@ The repository uses GitHub Actions for continuous integration and tagged binary 
 
 `.github/workflows/ci.yml` runs for pull requests and pushes to `main`. It can also be called by another workflow. Superseded runs for the same ref are cancelled.
 
-The workflow exposes these jobs, which can be selected as required checks in branch protection rules:
+The workflow exposes these jobs, which can be selected as required checks in branch protection rules. Compilation and tests use the declared MSRV; the coordinated workspace packaging step uses current stable Cargo so unpublished path dependencies can be staged together before the first crates.io release.
 
 - `format`: `cargo fmt --check`
 - `clippy`: `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
