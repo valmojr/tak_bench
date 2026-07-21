@@ -23,6 +23,7 @@ pub struct RunReport {
     pub status: RunStatus,
     pub abort_reason: Option<String>,
     pub assertions: Vec<AssertionResult>,
+    pub participant_failures: Vec<ParticipantFailure>,
     pub sanitized_config: SanitizedConfig,
 }
 
@@ -33,6 +34,43 @@ pub enum RunStatus {
     Failed,
     Aborted,
 }
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorPhase {
+    Connect,
+    TlsHandshake,
+    Readiness,
+    Read,
+    Write,
+    Parse,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCategory {
+    TcpConnectFailed,
+    TlsHandshakeFailed,
+    CaLoadFailed,
+    ClientCertificateLoadFailed,
+    ClientKeyLoadFailed,
+    TlsConfigurationFailed,
+    ReadinessTimeout,
+    PeerClosed,
+    ReadFailed,
+    WriteFailed,
+    CotParseFailed,
+    ReconnectExhausted,
+    ParticipantTaskFailed,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ParticipantFailure {
+    pub category: ErrorCategory,
+    pub phase: ErrorPhase,
+    pub participant: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct SanitizedConfig {
     pub environment: Environment,
@@ -40,10 +78,13 @@ pub struct SanitizedConfig {
     pub participants: Vec<String>,
     pub tls_enabled: bool,
     pub reconnect_enabled: bool,
+    pub wait_for_ready: Vec<String>,
+    pub lifecycle_jsonl: bool,
 }
 
 impl RunReport {
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: &AppConfig,
         started_at: OffsetDateTime,
@@ -52,6 +93,7 @@ impl RunReport {
         stop_reason: impl Into<String>,
         status: RunStatus,
         assertions: Vec<AssertionResult>,
+        participant_failures: Vec<ParticipantFailure>,
     ) -> Self {
         let stop_reason = stop_reason.into();
         Self {
@@ -68,6 +110,7 @@ impl RunReport {
             stop_reason,
             status,
             assertions,
+            participant_failures,
             sanitized_config: SanitizedConfig {
                 environment: config.environment,
                 profile: config.run.profile,
@@ -78,6 +121,8 @@ impl RunReport {
                     .collect(),
                 tls_enabled: config.tls.enabled,
                 reconnect_enabled: config.reconnect.enabled,
+                wait_for_ready: config.synchronization.wait_for_ready.clone(),
+                lifecycle_jsonl: config.output.lifecycle_jsonl,
             },
         }
     }
@@ -86,11 +131,9 @@ impl RunReport {
     /// Returns an error when the report directory cannot be created or written.
     pub fn write_json(&self, output: &Path) -> Result<()> {
         if let Some(parent) = output.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+            std::fs::create_dir_all(parent).context("creating report directory")?;
         }
-        std::fs::write(output, serde_json::to_vec_pretty(self)?)
-            .with_context(|| format!("writing {}", output.display()))
+        std::fs::write(output, serde_json::to_vec_pretty(self)?).context("writing JSON report")
     }
     #[must_use]
     pub fn terminal(&self) -> String {

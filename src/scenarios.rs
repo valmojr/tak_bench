@@ -1,14 +1,18 @@
 //! Built-in, server-neutral workload scenarios.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, atomic::Ordering},
     time::Instant,
 };
 
+use crate::lifecycle::{DisconnectReason, LifecycleEmitter, LifecycleEvent};
 use crate::protocol::{CotStreamDecoder, PositionEvent, inspect_event};
+use crate::report::{ErrorCategory, ErrorPhase, ParticipantFailure};
 use crate::{
-    config::{AppConfig, InvalidEventKind, ParticipantConfig, ParticipantRole, RoutingAssertion},
+    config::{
+        AppConfig, InvalidEventKind, ParticipantConfig, ParticipantRole, Profile, RoutingAssertion,
+    },
     connection::{self, ConnectionReader, ConnectionWriter},
     metrics::Metrics,
     scheduler::start_delays,
@@ -18,7 +22,7 @@ use rand::Rng;
 use time::OffsetDateTime;
 use tokio::{
     io::AsyncReadExt,
-    sync::{Mutex, watch},
+    sync::{Mutex, Notify, watch},
     time::{MissedTickBehavior, interval},
 };
 use uuid::Uuid;
@@ -26,19 +30,105 @@ use uuid::Uuid;
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AssertionResult {
     pub sender: String,
+    pub receiver: String,
+    pub expectation: RoutingExpectation,
     pub passed: bool,
-    pub expected_receivers: u64,
-    pub forbidden_receivers: u64,
+    pub received_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingExpectation {
+    Received,
+    NotReceived,
 }
 #[derive(Debug, Default, serde::Serialize)]
 pub struct ScenarioOutcome {
     pub assertions: Vec<AssertionResult>,
+    pub participant_failures: Vec<ParticipantFailure>,
 }
 
 #[derive(Default)]
 struct CorrelationLedger {
     sent: HashMap<Uuid, (String, Instant)>,
     seen: HashMap<(String, Uuid), Instant>,
+}
+
+struct ReadinessBarrier {
+    required: HashSet<String>,
+    ready: Mutex<HashSet<String>>,
+    notify: Notify,
+    deadline: tokio::time::Instant,
+}
+
+impl ReadinessBarrier {
+    fn new(config: &AppConfig, started: tokio::time::Instant) -> Self {
+        Self {
+            required: config
+                .synchronization
+                .wait_for_ready
+                .iter()
+                .cloned()
+                .collect(),
+            ready: Mutex::new(HashSet::new()),
+            notify: Notify::new(),
+            deadline: started
+                + config
+                    .synchronization
+                    .timeout
+                    .unwrap_or(config.run.duration),
+        }
+    }
+
+    async fn mark_ready(&self, participant: &str) {
+        if self.required.contains(participant) {
+            self.ready.lock().await.insert(participant.to_owned());
+            self.notify.notify_waiters();
+        }
+    }
+
+    async fn wait(&self, stop: &mut watch::Receiver<bool>) -> BarrierResult {
+        loop {
+            if self.required.is_subset(&*self.ready.lock().await) {
+                return BarrierResult::Ready;
+            }
+            tokio::select! {
+                () = self.notify.notified() => {}
+                changed = stop.changed() => if changed.is_err() || *stop.borrow() {
+                    return BarrierResult::Stopped;
+                },
+                () = tokio::time::sleep_until(self.deadline) => return BarrierResult::TimedOut,
+            }
+        }
+    }
+
+    async fn missing(&self) -> Vec<String> {
+        let ready = self.ready.lock().await;
+        let mut missing: Vec<_> = self.required.difference(&*ready).cloned().collect();
+        missing.sort();
+        missing
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BarrierResult {
+    Ready,
+    TimedOut,
+    Stopped,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ParticipantRuntimeError {
+    #[error("peer closed")]
+    PeerClosed,
+    #[error("read failed")]
+    Read,
+    #[error("write failed")]
+    Write,
+    #[error("CoT parse failed")]
+    Parse,
+    #[error("reconnect attempts exhausted")]
+    ReconnectExhausted,
 }
 
 /// Runs fixed `CoT` positions. Routing checks only observe the stream; they never configure a server.
@@ -51,11 +141,12 @@ pub async fn run_fixed_positions(
     metrics: Arc<Metrics>,
     stop: watch::Receiver<bool>,
 ) -> Result<ScenarioOutcome> {
-    run_fixed_positions_with_options(
+    run_fixed_positions_with_lifecycle(
         config,
         metrics,
         stop,
         crate::safety::SafetyOptions::default(),
+        LifecycleEmitter::disabled(),
     )
     .await
 }
@@ -69,17 +160,42 @@ pub async fn run_fixed_positions(
 pub async fn run_fixed_positions_with_options(
     config: AppConfig,
     metrics: Arc<Metrics>,
-    mut stop: watch::Receiver<bool>,
+    stop: watch::Receiver<bool>,
     safety_options: crate::safety::SafetyOptions,
 ) -> Result<ScenarioOutcome> {
+    run_fixed_positions_with_lifecycle(
+        config,
+        metrics,
+        stop,
+        safety_options,
+        LifecycleEmitter::disabled(),
+    )
+    .await
+}
+
+/// Runs fixed positions with a caller-provided sanitized lifecycle emitter.
+///
+/// # Errors
+///
+/// Returns an error for unsafe configuration or an invalid schedule. Participant runtime failures
+/// are preserved in the returned outcome so routing evidence can still be evaluated.
+pub async fn run_fixed_positions_with_lifecycle(
+    config: AppConfig,
+    metrics: Arc<Metrics>,
+    mut stop: watch::Receiver<bool>,
+    safety_options: crate::safety::SafetyOptions,
+    lifecycle: LifecycleEmitter,
+) -> Result<ScenarioOutcome> {
     crate::safety::validate_with_options(&config, safety_options)?;
-    let deadline = tokio::time::Instant::now() + config.run.duration;
+    let scenario_started = tokio::time::Instant::now();
+    let deadline = scenario_started + config.run.duration;
     let participants = participants(&config);
     let delays = start_delays(
         u32::try_from(participants.len()).map_err(|_| anyhow::anyhow!("too many participants"))?,
         &config.scheduler,
     )?;
     let ledger = Arc::new(Mutex::new(CorrelationLedger::default()));
+    let readiness = Arc::new(ReadinessBarrier::new(&config, scenario_started));
     let (cancel_tx, cancel) = watch::channel(*stop.borrow());
     let forward_tx = cancel_tx.clone();
     let forward_stop = tokio::spawn(async move {
@@ -92,32 +208,58 @@ pub async fn run_fixed_positions_with_options(
         let metrics = Arc::clone(&metrics);
         let ledger = Arc::clone(&ledger);
         let mut stop = cancel.clone();
+        let readiness = Arc::clone(&readiness);
+        let lifecycle = lifecycle.clone();
         tasks.spawn(async move {
             if !wait_for_delay(delay, &mut stop, deadline).await {
-                return Ok(());
+                return (participant.id, Ok(()));
             }
-            run_participant(participant, config, metrics, ledger, stop, deadline).await
+            let id = participant.id.clone();
+            let result = run_participant(
+                participant,
+                config,
+                metrics,
+                ledger,
+                readiness,
+                lifecycle,
+                stop,
+                deadline,
+            )
+            .await;
+            (id, result)
         });
     }
-    let mut first_error = None;
+    let mut participant_failures = Vec::new();
+    if !config.synchronization.wait_for_ready.is_empty()
+        && readiness.wait(&mut cancel.clone()).await == BarrierResult::TimedOut
+    {
+        participant_failures.extend(readiness.missing().await.into_iter().map(|participant| {
+            ParticipantFailure {
+                category: ErrorCategory::ReadinessTimeout,
+                phase: ErrorPhase::Readiness,
+                participant,
+            }
+        }));
+        let _ = cancel_tx.send(true);
+    }
     while let Some(task) = tasks.join_next().await {
-        let result = task
-            .map_err(|error| anyhow::anyhow!("participant task failed: {error}"))
-            .and_then(std::convert::identity);
-        if first_error.is_none()
-            && let Err(error) = result
-        {
-            first_error = Some(error);
-            let _ = cancel_tx.send(true);
+        match task {
+            Ok((_, Ok(()))) => {}
+            Ok((participant, Err(error))) => {
+                participant_failures.push(classify_participant_error(participant, &error));
+            }
+            Err(_) => participant_failures.push(ParticipantFailure {
+                category: ErrorCategory::ParticipantTaskFailed,
+                phase: ErrorPhase::Connect,
+                participant: "unknown".into(),
+            }),
         }
     }
     forward_stop.abort();
     let _ = forward_stop.await;
-    if let Some(error) = first_error {
-        return Err(error);
-    }
     Ok(ScenarioOutcome {
         assertions: evaluate_routing(&config.scenario.routing, &*ledger.lock().await),
+        participant_failures,
     })
 }
 
@@ -156,11 +298,14 @@ fn participants(config: &AppConfig) -> Vec<ParticipantConfig> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_participant(
     participant: ParticipantConfig,
     config: AppConfig,
     metrics: Arc<Metrics>,
     ledger: Arc<Mutex<CorrelationLedger>>,
+    readiness: Arc<ReadinessBarrier>,
+    lifecycle: LifecycleEmitter,
     mut stop: watch::Receiver<bool>,
     deadline: tokio::time::Instant,
 ) -> Result<()> {
@@ -190,17 +335,29 @@ async fn run_participant(
                     metrics.reconnects.fetch_add(1, Ordering::Relaxed);
                     metrics.record_recovery(recovery_started.elapsed()).await;
                 }
+                lifecycle.emit(&LifecycleEvent::ParticipantConnected {
+                    participant: participant.id.clone(),
+                });
+                lifecycle.emit(&LifecycleEvent::ParticipantReady {
+                    participant: participant.id.clone(),
+                });
+                readiness.mark_ready(&participant.id).await;
                 let result = run_connected(
                     &participant,
                     &config,
                     Arc::clone(&metrics),
                     Arc::clone(&ledger),
+                    Arc::clone(&readiness),
                     stop.clone(),
                     deadline,
                     connection,
                 )
                 .await;
                 metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
+                lifecycle.emit(&LifecycleEvent::ParticipantDisconnected {
+                    participant: participant.id.clone(),
+                    reason: disconnect_reason(&result, &stop, deadline),
+                });
                 if let Err(error) = &result {
                     metrics.connection_failures.fetch_add(1, Ordering::Relaxed);
                     if config.tls.enabled && is_tls_failure(error) {
@@ -221,21 +378,18 @@ async fn run_participant(
             }
             Err(error) => {
                 metrics.connection_failures.fetch_add(1, Ordering::Relaxed);
-                if is_tls_failure(&error) {
+                if error.is_tls() {
                     metrics.tls_failures.fetch_add(1, Ordering::Relaxed);
                 }
                 if !config.reconnect.enabled {
-                    return Err(error);
+                    return Err(error.into());
                 }
                 metrics.reconnect_failures.fetch_add(1, Ordering::Relaxed);
-                error
+                error.into()
             }
         };
         if attempt >= config.reconnect.max_attempts {
-            bail!(
-                "participant {} exhausted reconnect attempts",
-                participant.id
-            );
+            return Err(ParticipantRuntimeError::ReconnectExhausted.into());
         }
         attempt += 1;
         if !wait_for_delay(reconnect_delay(&config, attempt), &mut stop, deadline).await {
@@ -255,6 +409,75 @@ fn is_tls_failure(error: &anyhow::Error) -> bool {
     })
 }
 
+fn classify_participant_error(participant: String, error: &anyhow::Error) -> ParticipantFailure {
+    if let Some(connect) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::connection::ConnectError>())
+    {
+        return ParticipantFailure {
+            category: connect.category(),
+            phase: connect.phase(),
+            participant,
+        };
+    }
+    let (category, phase) = if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::config::TlsTemplateError>()
+            .is_some()
+    }) {
+        (
+            ErrorCategory::TlsConfigurationFailed,
+            ErrorPhase::TlsHandshake,
+        )
+    } else if let Some(runtime) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ParticipantRuntimeError>())
+    {
+        match runtime {
+            ParticipantRuntimeError::PeerClosed => (ErrorCategory::PeerClosed, ErrorPhase::Read),
+            ParticipantRuntimeError::Read => (ErrorCategory::ReadFailed, ErrorPhase::Read),
+            ParticipantRuntimeError::Write => (ErrorCategory::WriteFailed, ErrorPhase::Write),
+            ParticipantRuntimeError::Parse => (ErrorCategory::CotParseFailed, ErrorPhase::Parse),
+            ParticipantRuntimeError::ReconnectExhausted => {
+                (ErrorCategory::ReconnectExhausted, ErrorPhase::Connect)
+            }
+        }
+    } else {
+        (ErrorCategory::ParticipantTaskFailed, ErrorPhase::Connect)
+    };
+    ParticipantFailure {
+        category,
+        phase,
+        participant,
+    }
+}
+
+fn disconnect_reason(
+    result: &Result<()>,
+    stop: &watch::Receiver<bool>,
+    deadline: tokio::time::Instant,
+) -> DisconnectReason {
+    if let Err(error) = result {
+        let failure = classify_participant_error(String::new(), error);
+        return match failure.category {
+            ErrorCategory::PeerClosed => DisconnectReason::PeerClosed,
+            ErrorCategory::ReadFailed => DisconnectReason::ReadFailed,
+            ErrorCategory::WriteFailed => DisconnectReason::WriteFailed,
+            ErrorCategory::CotParseFailed => DisconnectReason::ParseFailed,
+            ErrorCategory::ReadinessTimeout => DisconnectReason::ReadinessTimeout,
+            ErrorCategory::ReconnectExhausted => DisconnectReason::ReconnectExhausted,
+            _ => DisconnectReason::ConnectFailed,
+        };
+    }
+    if *stop.borrow() {
+        DisconnectReason::ExternalStop
+    } else if tokio::time::Instant::now() >= deadline {
+        DisconnectReason::RunDeadline
+    } else {
+        DisconnectReason::ExternalStop
+    }
+}
+
 fn reconnect_delay(config: &AppConfig, attempt: u32) -> std::time::Duration {
     let multiplier = 2_u32.saturating_pow(attempt.saturating_sub(1));
     let base = config
@@ -270,11 +493,13 @@ fn reconnect_delay(config: &AppConfig, attempt: u32) -> std::time::Duration {
     base.mul_f64(factor)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_connected(
     participant: &ParticipantConfig,
     config: &AppConfig,
     metrics: Arc<Metrics>,
     ledger: Arc<Mutex<CorrelationLedger>>,
+    readiness: Arc<ReadinessBarrier>,
     mut stop: watch::Receiver<bool>,
     deadline: tokio::time::Instant,
     connection: connection::ClientConnection,
@@ -300,10 +525,14 @@ async fn run_connected(
             &mut stop,
             deadline,
             config.timeouts.read,
+            config.run.profile == Profile::Functional,
         )
         .await;
     }
     if participant.role == ParticipantRole::SendOnly {
+        if readiness.wait(&mut stop).await != BarrierResult::Ready {
+            return Ok(());
+        }
         return send_positions(
             participant,
             config,
@@ -318,6 +547,7 @@ async fn run_connected(
     let reader_participant = participant.clone();
     let mut reader_stop = stop.clone();
     let read_timeout = config.timeouts.read;
+    let tolerate_silence = config.run.profile == Profile::Functional;
     let reader_metrics = Arc::clone(&metrics);
     let reader_ledger = Arc::clone(&ledger);
     let mut reader_task = tokio::spawn(async move {
@@ -329,9 +559,15 @@ async fn run_connected(
             &mut reader_stop,
             deadline,
             read_timeout,
+            tolerate_silence,
         )
         .await
     });
+    if readiness.wait(&mut stop).await != BarrierResult::Ready {
+        reader_task.abort();
+        let _ = reader_task.await;
+        return Ok(());
+    }
     let mut sender = std::pin::pin!(send_positions(
         participant,
         config,
@@ -349,6 +585,7 @@ async fn run_connected(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn read_events(
     participant: &ParticipantConfig,
     mut reader: ConnectionReader,
@@ -357,6 +594,7 @@ async fn read_events(
     stop: &mut watch::Receiver<bool>,
     deadline: tokio::time::Instant,
     read_timeout: std::time::Duration,
+    tolerate_silence: bool,
 ) -> Result<()> {
     let mut decoder = CotStreamDecoder::new(8 * 1024 * 1024);
     let mut buffer = [0_u8; 8192];
@@ -371,19 +609,22 @@ async fn read_events(
             () = tokio::time::sleep_until(deadline) => return Ok(()),
             result = tokio::time::timeout(read_timeout, reader.read(&mut buffer)) => {
                 let count = if let Ok(result) = result {
-                    result?
+                    result.map_err(|_| ParticipantRuntimeError::Read)?
                 } else {
                     metrics.message_timeouts.fetch_add(1, Ordering::Relaxed);
-                    bail!("read timed out");
+                    if tolerate_silence {
+                        continue;
+                    }
+                    return Err(ParticipantRuntimeError::Read.into());
                 };
-                if count == 0 { bail!("peer closed the connection before the run deadline"); }
+                if count == 0 { return Err(ParticipantRuntimeError::PeerClosed.into()); }
                 if let Some(delay) = participant.read_delay
                     && !wait_for_delay(delay, stop, deadline).await
                 {
                     return Ok(());
                 }
-                for raw in decoder.push(&buffer[..count])? {
-                    let event = inspect_event(raw)?; metrics.received_messages.fetch_add(1, Ordering::Relaxed);
+                for raw in decoder.push(&buffer[..count]).map_err(|_| ParticipantRuntimeError::Parse)? {
+                    let event = inspect_event(raw).map_err(|_| ParticipantRuntimeError::Parse)?; metrics.received_messages.fetch_add(1, Ordering::Relaxed);
                     if let Some(correlation) = event.correlation_id { let mut state = ledger.lock().await;
                         if state.seen.insert((participant.id.clone(), correlation), Instant::now()).is_some() { metrics.duplicate_messages.fetch_add(1, Ordering::Relaxed); }
                         else if let Some((_, sent)) = state.sent.get(&correlation) { metrics.record_delivery(sent.elapsed()).await; }
@@ -421,7 +662,7 @@ async fn send_positions(
                     flush_batch(writer, participant, config, metrics, ledger, &mut batch).await?;
                     if let Err(error) = write_fragmented(writer, xml.as_bytes(), &config.scenario.fragmentation.chunk_sizes, config.timeouts.write).await {
                         record_write_failure(metrics, 1, &error);
-                        return Err(error);
+                        return Err(ParticipantRuntimeError::Write.into());
                     }
                     metrics.sent_messages.fetch_add(1, Ordering::Relaxed);
                 } else {
@@ -518,7 +759,7 @@ async fn flush_batch(
     .await
     {
         record_write_failure(metrics, batch.events, &error);
-        return Err(error);
+        return Err(ParticipantRuntimeError::Write.into());
     }
     metrics
         .sent_messages
@@ -616,7 +857,7 @@ fn evaluate_routing(
 ) -> Vec<AssertionResult> {
     assertions
         .iter()
-        .map(|assertion| {
+        .flat_map(|assertion| {
             let correlations: Vec<_> = state
                 .sent
                 .iter()
@@ -626,44 +867,43 @@ fn evaluate_routing(
             let timeout = assertion
                 .timeout
                 .unwrap_or(std::time::Duration::from_secs(30));
-            let expected = correlations
-                .iter()
-                .flat_map(|id| {
-                    assertion
-                        .receivers
-                        .iter()
-                        .map(move |receiver| (receiver, id))
-                })
-                .filter(|(receiver, id)| {
-                    state
-                        .seen
-                        .get(&((*receiver).clone(), **id))
-                        .is_some_and(|seen| {
-                            state
-                                .sent
-                                .get(*id)
-                                .is_some_and(|(_, sent)| seen.duration_since(*sent) <= timeout)
-                        })
-                })
-                .count() as u64;
-            let forbidden = correlations
-                .iter()
-                .flat_map(|id| {
-                    assertion
-                        .forbidden_receivers
-                        .iter()
-                        .map(move |receiver| (receiver, id))
-                })
-                .filter(|(receiver, id)| state.seen.contains_key(&((*receiver).clone(), **id)))
-                .count() as u64;
-            AssertionResult {
-                sender: assertion.sender.clone(),
-                passed: !correlations.is_empty()
-                    && expected == (correlations.len() * assertion.receivers.len()) as u64
-                    && forbidden == 0,
-                expected_receivers: expected,
-                forbidden_receivers: forbidden,
-            }
+            let expected = assertion.receivers.iter().map(|receiver| {
+                let received_count = correlations
+                    .iter()
+                    .filter(|id| {
+                        state
+                            .seen
+                            .get(&(receiver.clone(), **id))
+                            .is_some_and(|seen| {
+                                state
+                                    .sent
+                                    .get(*id)
+                                    .is_some_and(|(_, sent)| seen.duration_since(*sent) <= timeout)
+                            })
+                    })
+                    .count() as u64;
+                AssertionResult {
+                    sender: assertion.sender.clone(),
+                    receiver: receiver.clone(),
+                    expectation: RoutingExpectation::Received,
+                    passed: !correlations.is_empty() && received_count == correlations.len() as u64,
+                    received_count,
+                }
+            });
+            let forbidden = assertion.forbidden_receivers.iter().map(|receiver| {
+                let received_count = correlations
+                    .iter()
+                    .filter(|id| state.seen.contains_key(&(receiver.clone(), **id)))
+                    .count() as u64;
+                AssertionResult {
+                    sender: assertion.sender.clone(),
+                    receiver: receiver.clone(),
+                    expectation: RoutingExpectation::NotReceived,
+                    passed: !correlations.is_empty() && received_count == 0,
+                    received_count,
+                }
+            });
+            expected.chain(forbidden).collect::<Vec<_>>()
         })
         .collect()
 }
@@ -689,7 +929,10 @@ mod tests {
         pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
         server::WebPkiClientVerifier,
     };
-    use std::{path::PathBuf, sync::atomic::AtomicUsize};
+    use std::{
+        path::PathBuf,
+        sync::{Mutex as StdMutex, atomic::AtomicUsize},
+    };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{
@@ -1298,6 +1541,7 @@ mod tests {
         assert!(server.await.unwrap().is_empty());
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test(start_paused = true)]
     async fn abrupt_disconnect_isolated_and_reconnects_stop_at_max_attempts() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1329,11 +1573,14 @@ mod tests {
         let metrics = Arc::new(Metrics::new());
         let ledger = Arc::new(Mutex::new(CorrelationLedger::default()));
         let (_stop_tx, stop) = watch::channel(false);
-        let deadline = tokio::time::Instant::now() + config.run.duration;
+        let started = tokio::time::Instant::now();
+        let deadline = started + config.run.duration;
+        let readiness = Arc::new(ReadinessBarrier::new(&config, started));
         let flaky_config = config.clone();
         let flaky_metrics = Arc::clone(&metrics);
         let flaky_ledger = Arc::clone(&ledger);
         let flaky_stop = stop.clone();
+        let flaky_readiness = Arc::clone(&readiness);
         let flaky = tokio::spawn(async move {
             run_participant(
                 ParticipantConfig {
@@ -1343,6 +1590,8 @@ mod tests {
                 flaky_config,
                 flaky_metrics,
                 flaky_ledger,
+                flaky_readiness,
+                LifecycleEmitter::disabled(),
                 flaky_stop,
                 deadline,
             )
@@ -1354,6 +1603,7 @@ mod tests {
         let stable_a_metrics = Arc::clone(&metrics);
         let stable_a_ledger = Arc::clone(&ledger);
         let stable_a_stop = stop.clone();
+        let stable_a_readiness = Arc::clone(&readiness);
         let stable_a = tokio::spawn(async move {
             run_participant(
                 ParticipantConfig {
@@ -1363,6 +1613,8 @@ mod tests {
                 stable_a_config,
                 stable_a_metrics,
                 stable_a_ledger,
+                stable_a_readiness,
+                LifecycleEmitter::disabled(),
                 stable_a_stop,
                 deadline,
             )
@@ -1376,6 +1628,8 @@ mod tests {
             config,
             Arc::clone(&metrics),
             Arc::clone(&ledger),
+            readiness,
+            LifecycleEmitter::disabled(),
             stop,
             deadline,
         ));
@@ -1475,7 +1729,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn participant_failure_cancels_and_joins_remaining_work() {
+    async fn participant_failure_is_recorded_while_remaining_work_reaches_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -1504,10 +1758,14 @@ mod tests {
         ];
         let metrics = Arc::new(Metrics::new());
         let (_stop_tx, stop) = watch::channel(false);
-        assert!(
-            run_fixed_positions(config, Arc::clone(&metrics), stop)
-                .await
-                .is_err()
+        let outcome = run_fixed_positions(config, Arc::clone(&metrics), stop)
+            .await
+            .unwrap();
+        assert_eq!(outcome.participant_failures.len(), 1);
+        assert_eq!(outcome.participant_failures[0].participant, "failing");
+        assert_eq!(
+            outcome.participant_failures[0].category,
+            ErrorCategory::PeerClosed
         );
         assert!(server.await.unwrap().is_empty());
         assert_eq!(metrics.active_connections.load(Ordering::Relaxed), 0);
@@ -1646,10 +1904,13 @@ mod tests {
         }];
         let metrics = Arc::new(Metrics::new());
         let (_stop_tx, stop) = watch::channel(false);
-        assert!(
-            run_fixed_positions(config, Arc::clone(&metrics), stop)
-                .await
-                .is_err()
+        let outcome = run_fixed_positions(config, Arc::clone(&metrics), stop)
+            .await
+            .unwrap();
+        assert_eq!(outcome.participant_failures.len(), 1);
+        assert_eq!(
+            outcome.participant_failures[0].category,
+            ErrorCategory::TcpConnectFailed
         );
         assert_eq!(metrics.connection_attempts.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.connection_failures.load(Ordering::Relaxed), 1);
@@ -1702,10 +1963,13 @@ mod tests {
         }];
         let (_stop_tx, stop) = watch::channel(false);
         let metrics = Arc::new(Metrics::new());
-        assert!(
-            run_fixed_positions(config, Arc::clone(&metrics), stop)
-                .await
-                .is_err()
+        let outcome = run_fixed_positions(config, Arc::clone(&metrics), stop)
+            .await
+            .unwrap();
+        assert_eq!(outcome.participant_failures.len(), 1);
+        assert_eq!(
+            outcome.participant_failures[0].category,
+            ErrorCategory::ReadFailed
         );
         assert_eq!(metrics.message_timeouts.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.connection_failures.load(Ordering::Relaxed), 1);
@@ -1748,7 +2012,11 @@ mod tests {
             }],
             &state,
         );
+        assert_eq!(result.len(), 2);
         assert!(result[0].passed);
+        assert!(result[1].passed);
+        assert_eq!(result[0].expectation, RoutingExpectation::Received);
+        assert_eq!(result[1].expectation, RoutingExpectation::NotReceived);
         state.seen.insert(("forbidden".into(), id), Instant::now());
         assert!(
             !evaluate_routing(
@@ -1759,7 +2027,7 @@ mod tests {
                     timeout: None
                 }],
                 &state
-            )[0]
+            )[1]
             .passed
         );
         assert!(
@@ -1774,6 +2042,407 @@ mod tests {
             )[0]
             .passed
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn loopback_routing_reports_each_positive_and_negative_expectation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (receiver, _) = listener.accept().await.unwrap();
+            let (forbidden, _) = listener.accept().await.unwrap();
+            let (sender, _) = listener.accept().await.unwrap();
+            let (mut sender_read, _) = sender.into_split();
+            let (_, mut receiver_write) = receiver.into_split();
+            let _forbidden = forbidden;
+            let _ = tokio::io::copy(&mut sender_read, &mut receiver_write).await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        });
+        let mut config = loopback_config(address);
+        config.run.profile = Profile::Functional;
+        config.run.clients = 3;
+        config.run.duration = std::time::Duration::from_secs(1);
+        config.scheduler = SchedulerConfig {
+            strategy: RampStrategy::Step,
+            steps: vec![
+                RampStep {
+                    at: std::time::Duration::ZERO,
+                    clients: 1,
+                },
+                RampStep {
+                    at: std::time::Duration::from_millis(50),
+                    clients: 2,
+                },
+                RampStep {
+                    at: std::time::Duration::from_millis(100),
+                    clients: 3,
+                },
+            ],
+            ..SchedulerConfig::default()
+        };
+        config.participants = vec![
+            ParticipantConfig {
+                id: "a2".into(),
+                role: ParticipantRole::ReceiveOnly,
+                ..ParticipantConfig::default()
+            },
+            ParticipantConfig {
+                id: "b1".into(),
+                role: ParticipantRole::ReceiveOnly,
+                ..ParticipantConfig::default()
+            },
+            ParticipantConfig {
+                id: "a1".into(),
+                role: ParticipantRole::SendOnly,
+                ..ParticipantConfig::default()
+            },
+        ];
+        config.synchronization.wait_for_ready = vec!["a2".into(), "b1".into()];
+        config.synchronization.timeout = Some(std::time::Duration::from_millis(500));
+        config.scenario.routing = vec![RoutingAssertion {
+            sender: "a1".into(),
+            receivers: vec!["a2".into()],
+            forbidden_receivers: vec!["b1".into()],
+            timeout: Some(std::time::Duration::from_secs(1)),
+        }];
+        config.scenario.abrupt_disconnect = AbruptDisconnectConfig {
+            enabled: true,
+            after_events: 1,
+        };
+
+        let (_stop_tx, stop) = watch::channel(false);
+        let outcome = run_fixed_positions(config, Arc::new(Metrics::new()), stop)
+            .await
+            .unwrap();
+        assert!(outcome.participant_failures.is_empty());
+        assert_eq!(outcome.assertions.len(), 2);
+        assert_eq!(outcome.assertions[0].receiver, "a2");
+        assert_eq!(
+            outcome.assertions[0].expectation,
+            RoutingExpectation::Received
+        );
+        assert!(outcome.assertions[0].passed);
+        assert!(outcome.assertions[0].received_count > 0);
+        assert_eq!(outcome.assertions[1].receiver, "b1");
+        assert_eq!(
+            outcome.assertions[1].expectation,
+            RoutingExpectation::NotReceived
+        );
+        assert!(outcome.assertions[1].passed);
+        assert_eq!(outcome.assertions[1].received_count, 0);
+        server.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn readiness_barrier_opens_only_after_required_participant_connects() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sender, _) = listener.accept().await.unwrap();
+            let (_receiver, _) = listener.accept().await.unwrap();
+            let mut byte = [0_u8; 1];
+            sender.read_exact(&mut byte).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        });
+        let mut config = loopback_config(address);
+        config.run.profile = Profile::Functional;
+        config.run.clients = 2;
+        config.run.duration = std::time::Duration::from_secs(2);
+        config.run.gps_interval = std::time::Duration::from_millis(50);
+        config.participants = vec![
+            ParticipantConfig {
+                id: "a1".into(),
+                role: ParticipantRole::SendOnly,
+                ..ParticipantConfig::default()
+            },
+            ParticipantConfig {
+                id: "a2".into(),
+                role: ParticipantRole::ReceiveOnly,
+                ..ParticipantConfig::default()
+            },
+        ];
+        config.scheduler = SchedulerConfig {
+            strategy: RampStrategy::Step,
+            steps: vec![
+                RampStep {
+                    at: std::time::Duration::ZERO,
+                    clients: 1,
+                },
+                RampStep {
+                    at: std::time::Duration::from_secs(1),
+                    clients: 2,
+                },
+            ],
+            ..SchedulerConfig::default()
+        };
+        config.synchronization.wait_for_ready = vec!["a2".into()];
+        config.synchronization.timeout = Some(std::time::Duration::from_millis(1_500));
+        let metrics = Arc::new(Metrics::new());
+        let (_stop_tx, stop) = watch::channel(false);
+        let runner = tokio::spawn(run_fixed_positions(config, Arc::clone(&metrics), stop));
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_millis(999)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(metrics.sent_messages.load(Ordering::Relaxed), 0);
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        wait_for_connections(&metrics, 2).await;
+        tokio::time::advance(std::time::Duration::from_millis(50)).await;
+        wait_for_sent(&metrics, 1).await;
+        tokio::time::advance(std::time::Duration::from_millis(950)).await;
+        assert!(
+            runner
+                .await
+                .unwrap()
+                .unwrap()
+                .participant_failures
+                .is_empty()
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn readiness_barrier_timeout_is_deterministic_and_prevents_workload() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sender, _) = listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            sender.read_to_end(&mut received).await.unwrap();
+            received
+        });
+        let mut config = loopback_config(address);
+        config.run.clients = 2;
+        config.run.duration = std::time::Duration::from_secs(3);
+        config.participants = vec![
+            ParticipantConfig {
+                id: "a1".into(),
+                role: ParticipantRole::SendOnly,
+                ..ParticipantConfig::default()
+            },
+            ParticipantConfig {
+                id: "a2".into(),
+                role: ParticipantRole::ReceiveOnly,
+                ..ParticipantConfig::default()
+            },
+        ];
+        config.scheduler = SchedulerConfig {
+            strategy: RampStrategy::Step,
+            steps: vec![
+                RampStep {
+                    at: std::time::Duration::ZERO,
+                    clients: 1,
+                },
+                RampStep {
+                    at: std::time::Duration::from_secs(2),
+                    clients: 2,
+                },
+            ],
+            ..SchedulerConfig::default()
+        };
+        config.synchronization.wait_for_ready = vec!["a2".into()];
+        config.synchronization.timeout = Some(std::time::Duration::from_secs(1));
+        let metrics = Arc::new(Metrics::new());
+        let (_stop_tx, stop) = watch::channel(false);
+        let outcome = run_fixed_positions(config, Arc::clone(&metrics), stop)
+            .await
+            .unwrap();
+        assert_eq!(metrics.sent_messages.load(Ordering::Relaxed), 0);
+        assert_eq!(outcome.participant_failures.len(), 1);
+        assert_eq!(outcome.participant_failures[0].participant, "a2");
+        assert_eq!(
+            outcome.participant_failures[0].category,
+            ErrorCategory::ReadinessTimeout
+        );
+        assert!(server.await.unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn participant_failure_preserves_observable_routing_assertions() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (failing, _) = listener.accept().await.unwrap();
+            drop(failing);
+            let (silent, _) = listener.accept().await.unwrap();
+            let (mut sender, _) = listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            sender.read_to_end(&mut received).await.unwrap();
+            drop(silent);
+            received
+        });
+        let mut config = loopback_config(address);
+        config.run.profile = Profile::Functional;
+        config.run.clients = 3;
+        config.run.duration = std::time::Duration::from_secs(1);
+        config.scheduler = SchedulerConfig {
+            strategy: RampStrategy::Step,
+            steps: vec![
+                RampStep {
+                    at: std::time::Duration::ZERO,
+                    clients: 1,
+                },
+                RampStep {
+                    at: std::time::Duration::from_millis(50),
+                    clients: 2,
+                },
+                RampStep {
+                    at: std::time::Duration::from_millis(100),
+                    clients: 3,
+                },
+            ],
+            ..SchedulerConfig::default()
+        };
+        config.participants = vec![
+            ParticipantConfig {
+                id: "broken".into(),
+                role: ParticipantRole::ReceiveOnly,
+                ..ParticipantConfig::default()
+            },
+            ParticipantConfig {
+                id: "b1".into(),
+                role: ParticipantRole::ReceiveOnly,
+                ..ParticipantConfig::default()
+            },
+            ParticipantConfig {
+                id: "a1".into(),
+                role: ParticipantRole::SendOnly,
+                ..ParticipantConfig::default()
+            },
+        ];
+        config.synchronization.wait_for_ready = vec!["b1".into()];
+        config.synchronization.timeout = Some(std::time::Duration::from_millis(500));
+        config.scenario.routing = vec![RoutingAssertion {
+            sender: "a1".into(),
+            receivers: vec![],
+            forbidden_receivers: vec!["b1".into()],
+            timeout: None,
+        }];
+        let (_stop_tx, stop) = watch::channel(false);
+        let outcome = run_fixed_positions(config, Arc::new(Metrics::new()), stop)
+            .await
+            .unwrap();
+        assert_eq!(outcome.participant_failures.len(), 1);
+        assert_eq!(outcome.participant_failures[0].participant, "broken");
+        assert_eq!(outcome.assertions.len(), 1);
+        assert!(outcome.assertions[0].passed);
+        assert_eq!(outcome.assertions[0].received_count, 0);
+        assert!(!server.await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn loopback_lifecycle_json_lines_are_complete_and_sanitized() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+        });
+        let mut config = loopback_config(address);
+        config.run.duration = std::time::Duration::from_millis(100);
+        config.participants = vec![ParticipantConfig {
+            id: "a2".into(),
+            role: ParticipantRole::SendOnly,
+            ..ParticipantConfig::default()
+        }];
+        let lines = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let captured = Arc::clone(&lines);
+        let emitter = LifecycleEmitter::new(true, move |line| {
+            captured.lock().unwrap().push(line.to_owned());
+        });
+        let (_stop_tx, stop) = watch::channel(false);
+        let execution = crate::runner::execute_with_lifecycle(
+            config,
+            safety::SafetyOptions::default(),
+            stop,
+            emitter,
+        )
+        .await
+        .unwrap();
+        assert!(execution.passed());
+        server.await.unwrap();
+        let lines = lines.lock().unwrap();
+        let events: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events[0]["event"], "participant_connected");
+        assert_eq!(events[1]["event"], "participant_ready");
+        assert_eq!(events[2]["event"], "participant_disconnected");
+        assert_eq!(events[3]["event"], "run_completed");
+        assert_eq!(events[3]["status"], "passed");
+        for line in lines.iter() {
+            assert!(!line.contains("127.0.0.1"));
+            assert!(!line.contains("/tmp/"));
+            assert!(!line.contains("<event"));
+            assert!(!line.contains("PRIVATE KEY"));
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_failures_do_not_leak_paths_or_key_material() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+        });
+        let authority = TestAuthority::new("test-ca");
+        let (client, _client_key) = authority.issue("client.test");
+        let mut files = TempPemFiles::default();
+        let ca = files.write("sensitive-ca", authority.certificate.pem());
+        let client_cert = files.write("sensitive-client-cert", client.pem());
+        let missing_key = PathBuf::from(format!(
+            "/tmp/tak-bench-secret-{}/credentials/a2/client.key",
+            Uuid::new_v4()
+        ));
+        let mut config = loopback_config(address);
+        config.target.sni = Some("example.test".into());
+        config.tls = crate::config::TlsConfig {
+            enabled: true,
+            ca: Some(ca.clone()),
+            client_cert: Some(client_cert.clone()),
+            client_key: Some(missing_key.clone()),
+            ..crate::config::TlsConfig::default()
+        };
+        config.participants = vec![ParticipantConfig {
+            id: "a2".into(),
+            role: ParticipantRole::SendOnly,
+            ..ParticipantConfig::default()
+        }];
+        let lines = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let captured = Arc::clone(&lines);
+        let emitter = LifecycleEmitter::new(true, move |line| {
+            captured.lock().unwrap().push(line.to_owned());
+        });
+        let (_stop_tx, stop) = watch::channel(false);
+        let execution = crate::runner::execute_with_lifecycle(
+            config,
+            safety::SafetyOptions::default(),
+            stop,
+            emitter,
+        )
+        .await
+        .unwrap();
+        assert!(!execution.passed());
+        assert_eq!(
+            execution.report.participant_failures[0].category,
+            ErrorCategory::ClientKeyLoadFailed
+        );
+        let mut output = serde_json::to_string(&execution.report).unwrap();
+        output.push_str(&lines.lock().unwrap().join("\n"));
+        output.push_str(&execution.failure.unwrap().to_string());
+        for sensitive in [
+            ca.to_string_lossy(),
+            client_cert.to_string_lossy(),
+            missing_key.to_string_lossy(),
+        ] {
+            assert!(!output.contains(sensitive.as_ref()));
+        }
+        assert!(!output.contains("<event"));
+        assert!(!output.contains("PRIVATE KEY"));
+        server.await.unwrap();
     }
 
     #[test]
