@@ -9,7 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
 description = "Authorized, server-neutral TAK/CoT transport benchmark CLI"
-publish = false
+publish = ["crates-io"]
 
 [[bin]]
 name = "tak-bench"
@@ -21,6 +21,7 @@ clap.workspace = true
 serde_yaml.workspace = true
 tak-bench-core = { version = "0.1.0", path = "../tak-bench-core" }
 tak-bench-report = { version = "0.1.0", path = "../tak-bench-report" }
+tak-bench-runner = { version = "0.1.0", path = "../tak-bench-runner" }
 tak-bench-scenarios = { version = "0.1.0", path = "../tak-bench-scenarios" }
 time.workspace = true
 tokio.workspace = true

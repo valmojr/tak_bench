@@ -26,7 +26,7 @@ pub struct RunReport {
     pub sanitized_config: SanitizedConfig,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     Passed,

@@ -140,11 +140,117 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  publish-crates:
+    name: publish-crates-io
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the tagged revision
+        uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88.0"
+      - name: Publish crates in dependency order
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+            echo "the CRATES_IO_TOKEN repository secret is required" >&2
+            exit 1
+          fi
+
+          wait_for_index() {
+            local crate="$1"
+            local index_url="https://index.crates.io/${crate:0:2}/${crate:2:2}/${crate}"
+
+            for attempt in {1..60}; do
+              if curl --fail --silent --show-error \
+                --user-agent "tak-bench-release/${RELEASE_VERSION}" \
+                "$index_url" | grep --fixed-strings --quiet \
+                "\"vers\":\"${RELEASE_VERSION}\""; then
+                return 0
+              fi
+              sleep 5
+            done
+
+            echo "timed out waiting for ${crate} ${RELEASE_VERSION} in the crates.io index" >&2
+            return 1
+          }
+
+          publish_crate() {
+            local crate="$1"
+            local archive
+            local expected_checksum
+            local response
+            local remote_checksum
+
+            cargo package --package "$crate" --locked
+            archive="$(find target/package -type f \
+              -name "${crate}-${RELEASE_VERSION}.crate" -print -quit)"
+            if [[ -z "$archive" ]]; then
+              echo "could not locate the package archive for ${crate} ${RELEASE_VERSION}" >&2
+              return 1
+            fi
+            expected_checksum="$(sha256sum "$archive" | cut -d ' ' -f 1)"
+            response="$(curl --fail --silent --show-error \
+              --user-agent "tak-bench-release/${RELEASE_VERSION}" \
+              "https://crates.io/api/v1/crates/${crate}/${RELEASE_VERSION}" || true)"
+            remote_checksum="$(jq -r '.version.checksum // empty' <<<"$response")"
+
+            if [[ -n "$remote_checksum" ]]; then
+              if [[ "$remote_checksum" != "$expected_checksum" ]]; then
+                echo "crates.io already contains different contents for ${crate} ${RELEASE_VERSION}" >&2
+                return 1
+              fi
+              echo "${crate} ${RELEASE_VERSION} is already published with the expected checksum"
+              wait_for_index "$crate"
+              return
+            fi
+
+            cargo publish --package "$crate" --locked
+
+            for attempt in {1..60}; do
+              response="$(curl --fail --silent --show-error \
+                --user-agent "tak-bench-release/${RELEASE_VERSION}" \
+                "https://crates.io/api/v1/crates/${crate}/${RELEASE_VERSION}" || true)"
+              remote_checksum="$(jq -r '.version.checksum // empty' <<<"$response")"
+              if [[ "$remote_checksum" == "$expected_checksum" ]]; then
+                echo "verified ${crate} ${RELEASE_VERSION} on crates.io"
+                wait_for_index "$crate"
+                return
+              fi
+              if [[ -n "$remote_checksum" ]]; then
+                echo "crates.io returned an unexpected checksum for ${crate} ${RELEASE_VERSION}" >&2
+                return 1
+              fi
+              sleep 5
+            done
+
+            echo "timed out waiting for ${crate} ${RELEASE_VERSION} on crates.io" >&2
+            return 1
+          }
+
+          publish_crate tak-bench-core
+          publish_crate tak-bench-protocol
+          publish_crate tak-bench-scenarios
+          publish_crate tak-bench-report
+          publish_crate tak-bench-runner
+          publish_crate tak-bench-cli
+          publish_crate tak-bench-test-support
+
   publish:
     name: publish-github-release
     needs:
       - validate
       - build
+      - publish-crates
     runs-on: ubuntu-24.04
     permissions:
       contents: write

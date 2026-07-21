@@ -41,6 +41,8 @@ pub enum SafetyError {
     UnsupportedWorkload,
     #[error("the configured option is not implemented by the current runner")]
     UnsupportedOption,
+    #[error("participant TLS certificate templates are invalid")]
+    InvalidTlsTemplates,
     #[error("durations, timeouts, rates, and reconnect bounds must be finite and positive")]
     InvalidBounds,
     #[error("stress, spike, soak, and disruptive scenarios are local or temporary only")]
@@ -158,12 +160,10 @@ pub fn validate_workload(config: &AppConfig) -> Result<(), SafetyError> {
     {
         return Err(SafetyError::UnsupportedWorkload);
     }
-    if !config.scheduler.ramp_down.is_zero()
-        || config.tls.client_cert_template.is_some()
-        || config.tls.client_key_template.is_some()
-    {
+    if !config.scheduler.ramp_down.is_zero() {
         return Err(SafetyError::UnsupportedOption);
     }
+    validate_tls_templates(config)?;
 
     let disruptive = config.scenario.slow_connect.enabled
         || config.scenario.abrupt_disconnect.enabled
@@ -213,6 +213,24 @@ pub fn validate_workload(config: &AppConfig) -> Result<(), SafetyError> {
             || config.run.gps_interval < Duration::from_secs(1))
     {
         return Err(SafetyError::InvalidEventLimit);
+    }
+    Ok(())
+}
+
+fn validate_tls_templates(config: &AppConfig) -> Result<(), SafetyError> {
+    if config.participants.is_empty() {
+        if (0..config.run.clients)
+            .map(|index| format!("client-{index}"))
+            .any(|id| config.tls.for_participant(&id).is_err())
+        {
+            return Err(SafetyError::InvalidTlsTemplates);
+        }
+    } else if config
+        .participants
+        .iter()
+        .any(|participant| config.tls.for_participant(&participant.id).is_err())
+    {
+        return Err(SafetyError::InvalidTlsTemplates);
     }
     Ok(())
 }

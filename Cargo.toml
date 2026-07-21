@@ -5,6 +5,7 @@ members = [
     "crates/tak-bench-protocol",
     "crates/tak-bench-scenarios",
     "crates/tak-bench-report",
+    "crates/tak-bench-runner",
     "crates/tak-bench-test-support",
 ]
 resolver = "2"

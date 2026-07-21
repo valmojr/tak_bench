@@ -854,6 +854,7 @@ dependencies = [
  "serde_yaml",
  "tak-bench-core",
  "tak-bench-report",
+ "tak-bench-runner",
  "tak-bench-scenarios",
  "time",
  "tokio",
@@ -896,6 +897,18 @@ dependencies = [
  "tak-bench-core",
  "tak-bench-scenarios",
  "time",
+]
+
+[[package]]
+name = "tak-bench-runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tak-bench-core",
+ "tak-bench-report",
+ "tak-bench-scenarios",
+ "time",
+ "tokio",
 ]
 
 [[package]]

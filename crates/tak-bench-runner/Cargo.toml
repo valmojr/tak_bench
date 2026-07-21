@@ -1,5 +1,5 @@
 [package]
-name = "tak-bench-test-support"
+name = "tak-bench-runner"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,12 +8,16 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
-description = "Loopback fixture and provisioning test support for TAK Bench"
+description = "Reusable execution lifecycle for server-neutral TAK Bench workloads"
 publish = ["crates-io"]
 
 [dependencies]
-tokio.workspace = true
+anyhow.workspace = true
 tak-bench-core = { version = "0.1.0", path = "../tak-bench-core" }
+tak-bench-report = { version = "0.1.0", path = "../tak-bench-report" }
+tak-bench-scenarios = { version = "0.1.0", path = "../tak-bench-scenarios" }
+time.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

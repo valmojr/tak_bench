@@ -9,7 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
 description = "CoT XML generation and conservative stream framing for TAK Bench"
-publish = false
+publish = ["crates-io"]
 
 [dependencies]
 quick-xml.workspace = true

@@ -1,15 +1,12 @@
-use std::{path::PathBuf, str::FromStr, sync::Arc, time::Instant};
+use std::{path::PathBuf, str::FromStr};
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use tak_bench_core::{
     config::{AppConfig, Environment, Profile},
     connection,
-    metrics::Metrics,
     safety::{self, AUTHORIZATION_BANNER},
-    thresholds,
 };
-use tak_bench_report::{RunReport, RunStatus};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -172,7 +169,12 @@ async fn validate(
             },
         )?;
         println!("{AUTHORIZATION_BANNER}");
-        let _ = connection::connect(&config.target, &config.tls, &config.timeouts).await?;
+        let participant_id = config
+            .participants
+            .first()
+            .map_or("client-0", |participant| participant.id.as_str());
+        let tls = config.tls.for_participant(participant_id)?;
+        let _ = connection::connect(&config.target, &tls, &config.timeouts).await?;
         println!("Connection preflight succeeded.");
     } else {
         println!("Configuration is valid. Use --connect to perform a connection preflight.");
@@ -190,9 +192,7 @@ async fn run(args: RunArgs, forced_profile: Option<Profile>) -> Result<()> {
         allow_production: args.allow_production,
         allow_invalid_events: args.allow_invalid_events,
     };
-    safety::validate_with_options(&config, safety_options)?;
     println!("{AUTHORIZATION_BANNER}");
-    let metrics = Arc::new(Metrics::new());
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let signal_tx = stop_tx.clone();
     tokio::spawn(async move {
@@ -200,75 +200,12 @@ async fn run(args: RunArgs, forced_profile: Option<Profile>) -> Result<()> {
             let _ = signal_tx.send(true);
         }
     });
-    let started_at = time::OffsetDateTime::now_utc();
-    let started = Instant::now();
-    let threshold_reason = Arc::new(tokio::sync::Mutex::new(None));
-    let monitor_reason = Arc::clone(&threshold_reason);
-    let monitor_metrics = Arc::clone(&metrics);
-    let monitor_abort = config.abort.clone();
-    let monitor_tx = stop_tx.clone();
-    let monitor = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
-        loop {
-            ticker.tick().await;
-            if let Some(violation) =
-                thresholds::evaluate(&monitor_abort, &monitor_metrics.snapshot().await)
-            {
-                *monitor_reason.lock().await = Some(format!("threshold:{violation:?}"));
-                let _ = monitor_tx.send(true);
-                break;
-            }
-        }
-    });
-    let outcome = tak_bench_scenarios::run_fixed_positions_with_options(
-        config.clone(),
-        Arc::clone(&metrics),
-        stop_rx,
-        safety_options,
-    )
-    .await;
-    monitor.abort();
-    let threshold = threshold_reason.lock().await.clone();
-    let assertions = outcome
-        .as_ref()
-        .map_or_else(|_| Vec::new(), |value| value.assertions.clone());
-    let assertions_failed = assertions.iter().any(|assertion| !assertion.passed);
-    let stop_reason = if let Some(reason) = threshold.clone() {
-        reason
-    } else if outcome.is_ok() && !assertions_failed {
-        "completed".to_owned()
-    } else if assertions_failed {
-        "routing_assertion_failed".to_owned()
-    } else {
-        "scenario_error".to_owned()
-    };
-    let status = if threshold.is_some() {
-        RunStatus::Aborted
-    } else if outcome.is_ok() && !assertions_failed {
-        RunStatus::Passed
-    } else {
-        RunStatus::Failed
-    };
-    let report = RunReport::new(
-        &config,
-        started_at,
-        started.elapsed(),
-        metrics.snapshot().await,
-        stop_reason,
-        status,
-        assertions,
-    );
-    println!("{}", report.terminal());
+    let execution = tak_bench_runner::execute(config.clone(), safety_options, stop_rx).await?;
+    println!("{}", execution.report.terminal());
     if let Some(path) = &config.output.json {
-        report.write_json(path)?;
+        execution.report.write_json(path)?;
     }
-    outcome?;
-    if assertions_failed {
-        anyhow::bail!(
-            "one or more routing assertions failed (participant IDs and counts are in the report)"
-        );
-    }
-    Ok(())
+    execution.into_result().map(|_| ())
 }
 
 fn read_config(path: &PathBuf) -> Result<AppConfig> {

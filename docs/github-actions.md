@@ -6,7 +6,7 @@ The repository uses GitHub Actions for continuous integration and tagged binary 
 
 `.github/workflows/ci.yml` runs for pull requests and pushes to `main`. It can also be called by another workflow. Superseded runs for the same ref are cancelled.
 
-The workflow exposes these jobs, which can be selected as required checks in branch protection rules:
+The workflow exposes these jobs, which can be selected as required checks in branch protection rules. Compilation and tests use the declared MSRV; the coordinated workspace packaging step uses current stable Cargo so unpublished path dependencies can be staged together before the first crates.io release.
 
 - `format`: `cargo fmt --check`
 - `clippy`: `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
@@ -63,8 +63,8 @@ The binaries are not code-signed. SHA-256 checksums detect download corruption o
 
 ## Failures and reruns
 
-If validation, CI, or any platform build fails, the publish job does not run. Fix the problem on a new commit and create a new tag; do not move a published release tag.
+If validation, CI, or any platform build fails, neither crates.io nor the GitHub Release is published. Fix the problem on a new commit and create a new tag; do not move a published release tag.
 
-If only the final publication job fails transiently, rerun the failed jobs in GitHub Actions. The workflow creates the release when it is absent, completes a partial draft, or replaces assets in an existing mutable release while retaining its release notes. If the repository has immutable releases enabled, assets in an already published release cannot be replaced.
+The crates.io job publishes the workspace in dependency order using the repository's `CRATES_IO_TOKEN` secret. Reruns skip an existing crate only when its crates.io checksum matches the package built from the tag; this makes recovery from a partial publication safe. Published crate versions are immutable.
 
-This automation publishes GitHub Release binaries only. It does not publish workspace crates to crates.io and needs no repository secret beyond the automatically provided `GITHUB_TOKEN`.
+If only the GitHub Release publication fails transiently, rerun the failed jobs in GitHub Actions. The workflow creates the release when it is absent, completes a partial draft, or replaces assets in an existing mutable release while retaining its release notes. If the repository has immutable releases enabled, assets in an already published release cannot be replaced.
