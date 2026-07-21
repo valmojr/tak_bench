@@ -9,7 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
 description = "Authorized, server-neutral TAK/CoT transport benchmark CLI"
-publish = false
+publish = ["crates-io"]
 
 [[bin]]
 name = "tak-bench"

@@ -50,7 +50,7 @@ cargo fmt --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo build --workspace --release --locked
-cargo metadata --no-deps --locked --format-version 1
+cargo package --workspace --locked
 ```
 
 Slow local readers, bounded abrupt disconnects, bounded slow first writes, and carefully rate-limited invalid inputs are opt-in scenario controls. They are never production-safe. See [scenario guidance](docs/scenarios.md).

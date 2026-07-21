@@ -9,7 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
 description = "Sanitized terminal and JSON reports for TAK Bench"
-publish = false
+publish = ["crates-io"]
 
 [dependencies]
 anyhow.workspace = true

@@ -9,7 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
 description = "Server-neutral workload scenarios for TAK Bench"
-publish = false
+publish = ["crates-io"]
 
 [dependencies]
 anyhow.workspace = true
