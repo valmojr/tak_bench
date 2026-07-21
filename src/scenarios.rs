@@ -2054,9 +2054,9 @@ mod tests {
             let (sender, _) = listener.accept().await.unwrap();
             let (mut sender_read, _) = sender.into_split();
             let (_, mut receiver_write) = receiver.into_split();
-            let _forbidden = forbidden;
             let _ = tokio::io::copy(&mut sender_read, &mut receiver_write).await;
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            drop(forbidden);
         });
         let mut config = loopback_config(address);
         config.run.profile = Profile::Functional;
