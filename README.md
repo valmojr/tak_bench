@@ -27,7 +27,7 @@ cargo run -- smoke \
   --duration 2m
 ```
 
-A YAML configuration can define TLS/mTLS, participant roles, ramp-up, timeouts, reconnect, routing observations, fragmentation, thresholds, and stable JSON output. CLI flags override equivalent fields. Unsupported scenario and scheduling options are rejected before dialing. Start with [functional-routing.yaml](examples/functional-routing.yaml).
+A YAML configuration can define TLS/mTLS, participant roles, ramp-up, timeouts, reconnect, readiness synchronization, routing observations, fragmentation, thresholds, and stable JSON output. CLI flags override equivalent fields. `--lifecycle-jsonl` (or `output.lifecycle_jsonl: true`) reserves stdout for sanitized orchestration events; the JSON report remains the primary artifact. Unsupported scenario and scheduling options are rejected before dialing. Start with [functional-routing.yaml](examples/functional-routing.yaml).
 
 ## Current capabilities
 
@@ -37,11 +37,19 @@ A YAML configuration can define TLS/mTLS, participant roles, ramp-up, timeouts, 
 - Concurrent reading and writing, received/duplicate message counts, and local delivery latency when the correlation extension is preserved.
 - `immediate`, `linear`, `step`, and `randomized` ramps; connection, message, latency, and drop thresholds that cooperatively stop a run.
 - Participant roles (`send_only`, `receive_only`, and `send_receive`), bounded reconnect with jitter, per-operation timeouts, CoT batching and fragmentation.
-- Observational routing assertions: sender correlations must arrive at named receivers and not at forbidden receivers; the harness does not configure server routing.
-- Terminal and JSON reports with final status, abort reason, sanitized configuration, metrics, and assertion results.
+- Observational routing assertions: each expected or forbidden sender/receiver pair has its own sanitized result and observed count; the harness does not configure server routing.
+- An optional readiness barrier gates sender workloads on named participants. "Ready" means that the participant completed TCP and, when configured, TLS/mTLS setup and can execute its local role. It does not claim server-side authorization, registration, presence, or policy acceptance.
+- Optional sanitized JSON Lines lifecycle events (`participant_connected`, `participant_ready`, `participant_disconnected`, and `run_completed`) containing aliases and classified reasons only.
+- Terminal and JSON reports with final status, abort reason, sanitized configuration, metrics, per-participant classified failures, and assertion results.
 - A server-neutral `Provisioner` interface and `FakeProvisioner` for tests; no Vanguarda-specific or other server-specific API is embedded.
 - A reusable `tak_bench::runner` module so external integrations can provision their own
   fixtures and execute the same guarded workload lifecycle as the CLI from one public crate.
+
+## Compatibility contract
+
+The harness only observes whether a server accepts TCP/TLS/mTLS connections, delivers events to clients, preserves the correlation identifier required by configured assertions, and closes or rejects sockets according to its own policy. It has no administrative view into a TAK Server.
+
+Preservation of the correlation extension and acceptance of a receive-only client that sends no initial announcement are integration properties of the consumer's chosen server. `tak_bench` does not assume either behavior. Provisioning identities, certificates, groups, policy, revocation, and cleanup remains the external orchestrator's responsibility.
 
 ## Development
 

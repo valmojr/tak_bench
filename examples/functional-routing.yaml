@@ -3,12 +3,19 @@ authorization: { acknowledged: true }
 environment: local
 allow_hosts: [example.test]
 target: { server: example.test:8089 }
-run: { profile: functional, clients: 2, max_clients: 10, duration: 1m, gps_interval: 5s }
+run: { profile: functional, clients: 3, max_clients: 10, duration: 1m, gps_interval: 5s }
 participants:
-  - { id: sender, role: send_only }
-  - { id: receiver, role: receive_only }
+  - { id: a1, role: send_only }
+  - { id: a2, role: receive_only }
+  - { id: b1, role: receive_only }
+synchronization:
+  wait_for_ready: [a2, b1]
+  timeout: 15s
 scenario:
   kind: position
   movement: fixed
   routing:
-    - { sender: sender, receivers: [receiver], forbidden_receivers: [] }
+    - { sender: a1, receivers: [a2], forbidden_receivers: [b1] }
+output:
+  json: artifacts/routing-report.json
+  lifecycle_jsonl: true

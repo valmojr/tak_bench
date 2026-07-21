@@ -10,3 +10,7 @@ When a server requires one identity per socket, `tls.client_cert_template` and
 `tls.client_key_template` resolve `{participant_id}` for each configured participant. The
 participant ID is restricted to path-safe ASCII characters, the templates must be supplied as a
 pair, and they cannot be mixed with the global client certificate fields.
+
+Readiness is entirely client-side: a participant becomes ready after its TCP connection and any configured TLS/mTLS handshake complete, immediately before it begins its local send/receive role. A configured barrier uses participant aliases and notifications to hold senders; it never polls or infers server sessions, authorization, registration, or routing policy.
+
+Lifecycle JSON Lines use a closed schema of participant aliases, event names, completion states, and classified disconnect reasons. Runtime failures in the primary report likewise contain only alias, phase, and category. Credential paths, local temporary paths, raw error strings, certificates, keys, and CoT payloads are excluded.
