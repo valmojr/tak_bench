@@ -86,8 +86,8 @@ struct RunArgs {
     gps_interval: Option<String>,
     #[arg(long)]
     max_rate: Option<f64>,
-    #[arg(long)]
-    output: Option<PathBuf>,
+    #[command(flatten)]
+    output: OutputArgs,
     #[arg(long)]
     acknowledge_authorization: bool,
     #[arg(long)]
@@ -96,8 +96,24 @@ struct RunArgs {
     allow_invalid_events: bool,
 }
 
+#[derive(Debug, Args)]
+struct OutputArgs {
+    #[arg(long = "output")]
+    json: Option<PathBuf>,
+    /// Emit sanitized lifecycle JSON Lines on stdout.
+    #[arg(long)]
+    lifecycle_jsonl: bool,
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(error) = command().await {
+        eprintln!("{}", sanitized_cli_error(&error));
+        std::process::exit(1);
+    }
+}
+
+async fn command() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -124,8 +140,7 @@ async fn main() -> Result<()> {
             let metadata =
                 std::fs::metadata(&ca).with_context(|| format!("reading {}", ca.display()))?;
             println!(
-                "CA file {} is readable ({} bytes). Full certificate inspection is planned with test-PKI support.",
-                ca.display(),
+                "CA file is readable ({} bytes). Full certificate inspection is planned with test-PKI support.",
                 metadata.len()
             );
             Ok(())
@@ -192,7 +207,11 @@ async fn run(args: RunArgs, forced_profile: Option<Profile>) -> Result<()> {
         allow_production: args.allow_production,
         allow_invalid_events: args.allow_invalid_events,
     };
-    println!("{AUTHORIZATION_BANNER}");
+    if config.output.lifecycle_jsonl {
+        eprintln!("{AUTHORIZATION_BANNER}");
+    } else {
+        println!("{AUTHORIZATION_BANNER}");
+    }
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let signal_tx = stop_tx.clone();
     tokio::spawn(async move {
@@ -201,7 +220,11 @@ async fn run(args: RunArgs, forced_profile: Option<Profile>) -> Result<()> {
         }
     });
     let execution = tak_bench::runner::execute(config.clone(), safety_options, stop_rx).await?;
-    println!("{}", execution.report.terminal());
+    if config.output.lifecycle_jsonl {
+        eprintln!("{}", execution.report.terminal());
+    } else {
+        println!("{}", execution.report.terminal());
+    }
     if let Some(path) = &config.output.json {
         execution.report.write_json(path)?;
     }
@@ -246,11 +269,35 @@ fn apply_overrides(
     if let Some(value) = args.max_rate {
         config.run.max_rate = Some(value);
     }
-    if let Some(path) = &args.output {
+    if let Some(path) = &args.output.json {
         config.output.json = Some(path.clone());
     }
+    config.output.lifecycle_jsonl |= args.output.lifecycle_jsonl;
     config.authorization.acknowledged |= args.acknowledge_authorization;
     Ok(())
+}
+
+fn sanitized_cli_error(error: &anyhow::Error) -> String {
+    if let Some(connect) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<connection::ConnectError>())
+    {
+        return serde_json::json!({
+            "category": connect.category(),
+            "phase": connect.phase(),
+        })
+        .to_string();
+    }
+    if let Some(safety) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<safety::SafetyError>())
+    {
+        return safety.to_string();
+    }
+    if error.to_string() == "run failed; see the sanitized JSON report" {
+        return error.to_string();
+    }
+    serde_json::json!({ "category": "command_failed" }).to_string()
 }
 
 fn parse_duration(raw: &str) -> Result<std::time::Duration> {
