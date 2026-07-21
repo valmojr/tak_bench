@@ -2,7 +2,7 @@ use std::{collections::HashSet, time::Duration};
 
 use crate::config::{
     AppConfig, Environment, Movement, ParticipantRole, Profile, ScenarioKind, host_from_server,
-    is_loopback,
+    is_loopback, is_safe_participant_id,
 };
 use thiserror::Error;
 
@@ -33,10 +33,12 @@ pub enum SafetyError {
     ParticipantCountMismatch,
     #[error("at least one participant is required")]
     NoParticipants,
-    #[error("participant IDs must be non-empty and unique")]
+    #[error("participant aliases must be unique path-safe ASCII identifiers")]
     InvalidParticipantId,
     #[error("routing assertions must reference participants with compatible roles")]
     InvalidRoutingAssertion,
+    #[error("readiness synchronization must reference unique configured participants")]
+    InvalidSynchronization,
     #[error("only fixed position workloads are currently implemented")]
     UnsupportedWorkload,
     #[error("the configured option is not implemented by the current runner")]
@@ -134,6 +136,7 @@ pub fn validate_workload(config: &AppConfig) -> Result<(), SafetyError> {
         return Err(SafetyError::ClientLimit);
     }
     validate_participants_and_routing(config)?;
+    validate_synchronization(config)?;
 
     let timeouts = &config.timeouts;
     if config.run.duration.is_zero()
@@ -142,6 +145,10 @@ pub fn validate_workload(config: &AppConfig) -> Result<(), SafetyError> {
         || timeouts.tls_handshake.is_zero()
         || timeouts.read.is_zero()
         || timeouts.write.is_zero()
+        || config
+            .synchronization
+            .timeout
+            .is_some_and(|duration| duration.is_zero())
         || config.run.max_rate.is_some_and(|rate| {
             let interval = 1.0 / rate;
             !rate.is_finite()
@@ -244,11 +251,9 @@ fn validate_participants_and_routing(config: &AppConfig) -> Result<(), SafetyErr
         };
     }
     let mut ids = HashSet::with_capacity(config.participants.len());
-    if config
-        .participants
-        .iter()
-        .any(|participant| participant.id.is_empty() || !ids.insert(participant.id.as_str()))
-    {
+    if config.participants.iter().any(|participant| {
+        !is_safe_participant_id(&participant.id) || !ids.insert(participant.id.as_str())
+    }) {
         return Err(SafetyError::InvalidParticipantId);
     }
     for assertion in &config.scenario.routing {
@@ -272,6 +277,30 @@ fn validate_participants_and_routing(config: &AppConfig) -> Result<(), SafetyErr
         {
             return Err(SafetyError::InvalidRoutingAssertion);
         }
+    }
+    Ok(())
+}
+
+fn validate_synchronization(config: &AppConfig) -> Result<(), SafetyError> {
+    if config.synchronization.wait_for_ready.is_empty() {
+        return if config.synchronization.timeout.is_none() {
+            Ok(())
+        } else {
+            Err(SafetyError::InvalidSynchronization)
+        };
+    }
+    if config.participants.is_empty() || config.synchronization.timeout.is_none() {
+        return Err(SafetyError::InvalidSynchronization);
+    }
+    let mut required = HashSet::new();
+    if config.synchronization.wait_for_ready.iter().any(|id| {
+        !required.insert(id.as_str())
+            || !config
+                .participants
+                .iter()
+                .any(|participant| participant.id == *id)
+    }) {
+        return Err(SafetyError::InvalidSynchronization);
     }
     Ok(())
 }
@@ -481,6 +510,50 @@ mod tests {
         assert_eq!(
             validate_workload(&unsupported),
             Err(SafetyError::UnsupportedWorkload)
+        );
+    }
+
+    #[test]
+    fn readiness_aliases_and_timeout_are_validated() {
+        let participant = crate::config::ParticipantConfig {
+            id: "a2".into(),
+            ..crate::config::ParticipantConfig::default()
+        };
+        let missing_timeout = AppConfig {
+            participants: vec![participant.clone()],
+            synchronization: crate::config::SynchronizationConfig {
+                wait_for_ready: vec!["a2".into()],
+                timeout: None,
+            },
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            validate_workload(&missing_timeout),
+            Err(SafetyError::InvalidSynchronization)
+        );
+
+        let unknown_alias = AppConfig {
+            synchronization: crate::config::SynchronizationConfig {
+                wait_for_ready: vec!["missing".into()],
+                timeout: Some(Duration::from_secs(1)),
+            },
+            ..missing_timeout
+        };
+        assert_eq!(
+            validate_workload(&unknown_alias),
+            Err(SafetyError::InvalidSynchronization)
+        );
+
+        let unsafe_alias = AppConfig {
+            participants: vec![crate::config::ParticipantConfig {
+                id: "/tmp/credentials/a2".into(),
+                ..participant
+            }],
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            validate_workload(&unsafe_alias),
+            Err(SafetyError::InvalidParticipantId)
         );
     }
 }
