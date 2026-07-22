@@ -53,6 +53,42 @@ The harness only observes whether a server accepts TCP/TLS/mTLS connections, del
 
 Preservation of the correlation extension and acceptance of a receive-only client that sends no initial announcement are integration properties of the consumer's chosen server. `tak_bench` does not assume either behavior. Provisioning identities, certificates, groups, policy, revocation, and cleanup remains the external orchestrator's responsibility.
 
+## Reusable GitHub Action
+
+The repository includes a neutral composite action. Pin it to an approved full commit SHA; it installs the supported Rust toolchain and builds that exact source revision with `--locked`. With a configuration it runs the workload and returns the sanitized report path, but it never uploads artifacts, provisions fixtures, revokes credentials, or calls a server administration API:
+
+```yaml
+- name: Run neutral routing check
+  id: tak-bench
+  uses: valmojr/tak_bench@<full-commit-sha>
+  with:
+    config: staging/routing.yaml
+    report: artifacts/routing-report.json
+    lifecycle-jsonl: "true"
+
+- name: Upload sanitized evidence only
+  uses: actions/upload-artifact@v7
+  with:
+    name: tak-bench-report
+    path: ${{ steps.tak-bench.outputs.report-path }}
+    if-no-files-found: error
+```
+
+When a consumer-owned wrapper must react to lifecycle events while the process is running, use setup-only mode and pass the binary output to that wrapper. The wrapper remains responsible for fixture lifecycle and any product-specific action:
+
+```yaml
+- name: Build approved TAK Bench revision
+  id: tak-bench
+  uses: valmojr/tak_bench@<full-commit-sha>
+
+- name: Run consumer staging wrapper
+  env:
+    TAK_BENCH_BIN: ${{ steps.tak-bench.outputs.binary-path }}
+  run: ./scripts/run-staging-routing.sh
+```
+
+Lifecycle JSONL should be consumed live and discarded. Only the sanitized JSON report should be uploaded as evidence.
+
 ## Development
 
 ```bash
