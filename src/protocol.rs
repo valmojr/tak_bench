@@ -29,7 +29,7 @@ impl PositionEvent {
                 "time=\"{}\" start=\"{}\" stale=\"{}\" how=\"m-g\">",
                 "<point lat=\"{}\" lon=\"{}\" hae=\"{}\" ce=\"9999999\" le=\"9999999\"/>",
                 "<detail><contact callsign=\"{}\"/><takv device=\"tak_bench\" os=\"Linux\" ",
-                "platform=\"tak_bench\" version=\"0.1.0\"/><track course=\"{}\" speed=\"{}\"/>",
+                "platform=\"tak_bench\" version=\"{}\"/><track course=\"{}\" speed=\"{}\"/>",
                 "<tak_bench correlation_id=\"{}\"/></detail></event>"
             ),
             escape(&self.uid),
@@ -40,6 +40,7 @@ impl PositionEvent {
             self.longitude,
             self.altitude_m,
             escape(&self.callsign),
+            env!("CARGO_PKG_VERSION"),
             self.course_deg,
             self.speed_mps,
             self.correlation_id,

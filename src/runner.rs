@@ -2,14 +2,15 @@
 
 use std::{sync::Arc, time::Instant};
 
-use anyhow::{Result, anyhow};
-use tak_bench_core::{
+use crate::lifecycle::{CompletionStatus, LifecycleEmitter, LifecycleEvent};
+use crate::report::{RunReport, RunStatus};
+use crate::{
     config::AppConfig,
     metrics::Metrics,
     safety::{self, SafetyOptions},
     thresholds,
 };
-use tak_bench_report::{RunReport, RunStatus};
+use anyhow::{Result, anyhow};
 use tokio::sync::watch;
 
 /// A completed execution always carries a sanitized report, including failed scenarios.
@@ -42,6 +43,21 @@ pub async fn execute(
     config: AppConfig,
     safety_options: SafetyOptions,
     stop: watch::Receiver<bool>,
+) -> Result<RunExecution> {
+    let lifecycle = LifecycleEmitter::stdout(config.output.lifecycle_jsonl);
+    execute_with_lifecycle(config, safety_options, stop, lifecycle).await
+}
+
+/// Executes a workload with a caller-provided sanitized lifecycle event sink.
+///
+/// # Errors
+///
+/// Returns an error only when configuration is unsafe or invalid.
+pub async fn execute_with_lifecycle(
+    config: AppConfig,
+    safety_options: SafetyOptions,
+    stop: watch::Receiver<bool>,
+    lifecycle: LifecycleEmitter,
 ) -> Result<RunExecution> {
     safety::validate_with_options(&config, safety_options)?;
     let metrics = Arc::new(Metrics::new());
@@ -77,11 +93,12 @@ pub async fn execute(
             }
         }
     });
-    let outcome = tak_bench_scenarios::run_fixed_positions_with_options(
+    let outcome = crate::scenarios::run_fixed_positions_with_lifecycle(
         config.clone(),
         Arc::clone(&metrics),
         threshold_rx,
         safety_options,
+        lifecycle.clone(),
     )
     .await;
     monitor.abort();
@@ -91,9 +108,13 @@ pub async fn execute(
         .as_ref()
         .map_or_else(|_| Vec::new(), |value| value.assertions.clone());
     let assertions_failed = assertions.iter().any(|assertion| !assertion.passed);
+    let participant_failures = outcome
+        .as_ref()
+        .map_or_else(|_| Vec::new(), |value| value.participant_failures.clone());
+    let participants_failed = !participant_failures.is_empty();
     let stop_reason = if let Some(reason) = threshold.clone() {
         reason
-    } else if outcome.is_ok() && !assertions_failed {
+    } else if outcome.is_ok() && !assertions_failed && !participants_failed {
         "completed".to_owned()
     } else if assertions_failed {
         "routing_assertion_failed".to_owned()
@@ -102,7 +123,7 @@ pub async fn execute(
     };
     let status = if threshold.is_some() {
         RunStatus::Aborted
-    } else if outcome.is_ok() && !assertions_failed {
+    } else if outcome.is_ok() && !assertions_failed && !participants_failed {
         RunStatus::Passed
     } else {
         RunStatus::Failed
@@ -115,13 +136,21 @@ pub async fn execute(
         stop_reason,
         status,
         assertions,
+        participant_failures,
     );
     let failure = match outcome {
         Err(error) => Some(error),
-        Ok(_) if assertions_failed => Some(anyhow!(
-            "one or more routing assertions failed (participant IDs and counts are in the report)"
-        )),
+        Ok(_) if assertions_failed || participants_failed => {
+            Some(anyhow!("run failed; see the sanitized JSON report"))
+        }
         Ok(_) => None,
     };
+    lifecycle.emit(&LifecycleEvent::RunCompleted {
+        status: match status {
+            RunStatus::Passed => CompletionStatus::Passed,
+            RunStatus::Failed => CompletionStatus::Failed,
+            RunStatus::Aborted => CompletionStatus::Aborted,
+        },
+    });
     Ok(RunExecution { report, failure })
 }

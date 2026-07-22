@@ -70,8 +70,18 @@ pub struct AppConfig {
     pub timeouts: TimeoutConfig,
     pub abort: AbortConfig,
     pub participants: Vec<ParticipantConfig>,
+    pub synchronization: SynchronizationConfig,
     pub scenario: ScenarioConfig,
     pub output: OutputConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SynchronizationConfig {
+    /// Participant aliases whose completed TCP/TLS/mTLS connections gate sender workloads.
+    pub wait_for_ready: Vec<String>,
+    #[serde(with = "optional_duration_serde")]
+    pub timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -153,7 +163,7 @@ impl TlsConfig {
 )]
 pub struct TlsTemplateError;
 
-fn is_safe_participant_id(value: &str) -> bool {
+pub(crate) fn is_safe_participant_id(value: &str) -> bool {
     !value.is_empty()
         && value
             .bytes()
@@ -410,6 +420,8 @@ pub struct AbruptDisconnectConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct OutputConfig {
     pub json: Option<PathBuf>,
+    /// Emits sanitized lifecycle records as JSON Lines on stdout.
+    pub lifecycle_jsonl: bool,
 }
 
 #[derive(Debug, Error)]

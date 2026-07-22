@@ -1,7 +1,7 @@
 //! Helpers reserved for TCP/TLS fixture servers shared by integration tests.
 
+use crate::provisioning::{FixtureHandle, FixtureSpec, Provisioner, ProvisioningError};
 use std::net::SocketAddr;
-use tak_bench_core::provisioning::{FixtureHandle, FixtureSpec, Provisioner, ProvisioningError};
 use tokio::net::TcpListener;
 
 /// # Errors

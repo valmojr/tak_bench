@@ -2,6 +2,12 @@
 
 The built-in fixed CoT position scenario supports explicit participant roles, local routing observations, batching, fragmentation, bounded reconnect and timeouts. Routing assertions observe correlations only; they do not configure groups, permissions, or any server policy.
 
+Each routing expectation is reported independently with `sender`, `receiver`, `expectation`, `passed`, and `received_count`; no CoT XML is retained in the report. During the functional profile, a read timeout on a receive-capable participant means that no message was observed during that interval and reading continues to the global deadline. EOF, TLS, connection, write, and parse failures remain failures. All observable assertions are evaluated after participant tasks finish, even when another participant failed.
+
+`synchronization.wait_for_ready` is an optional sender barrier. Every listed alias must complete TCP plus any configured TLS/mTLS handshake before sending begins, or `synchronization.timeout` produces a deterministic `readiness_timeout` failure. This readiness state is local transport readiness only and is not server authorization or presence confirmation.
+
+An external consumer may react to `participant_ready` or `participant_connected` while the process is running, but lifecycle stdout is not the evidence artifact. The consumer should retain only the sanitized JSON report and locate assertions by the complete tuple `(sender, receiver, expectation)`, without depending on array order. For functional routing, setting `timeouts.read` beyond `run.duration` ensures that the global deadline, rather than an operation timeout, closes a silent receiver.
+
 Profiles classify reports and select environment guardrails; participant counts, cadence, thresholds and reconnect behavior remain explicit configuration. Production only accepts `smoke`. `stress`, `spike`, and `soak` are limited to local or temporary environments.
 
 `smoke` is suitable for an authorized production check without aggressive load. `functional` is for local or staging. `load` (10–250 clients) needs an authorized environment. `stress`, `spike`, `soak`, slow readers, slow first writes, abrupt disconnects, and invalid payloads are local/temporary only, except where staging guardrails explicitly permit invalid events. Production is not a stress-test environment.

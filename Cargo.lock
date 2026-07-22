@@ -846,94 +846,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "tak-bench-cli"
-version = "0.1.0"
+name = "tak-bench"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
- "serde_yaml",
- "tak-bench-core",
- "tak-bench-report",
- "tak-bench-runner",
- "tak-bench-scenarios",
- "time",
- "tokio",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "tak-bench-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
  "hdrhistogram",
- "rand",
- "rustls",
- "serde",
- "serde_yaml",
- "thiserror",
- "tokio",
- "tokio-rustls",
- "tracing",
-]
-
-[[package]]
-name = "tak-bench-protocol"
-version = "0.1.0"
-dependencies = [
  "quick-xml",
- "thiserror",
- "time",
- "uuid",
-]
-
-[[package]]
-name = "tak-bench-report"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "tak-bench-core",
- "tak-bench-scenarios",
- "time",
-]
-
-[[package]]
-name = "tak-bench-runner"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "tak-bench-core",
- "tak-bench-report",
- "tak-bench-scenarios",
- "time",
- "tokio",
-]
-
-[[package]]
-name = "tak-bench-scenarios"
-version = "0.1.0"
-dependencies = [
- "anyhow",
  "rand",
  "rcgen",
  "rustls",
  "serde",
- "tak-bench-core",
- "tak-bench-protocol",
+ "serde_json",
+ "serde_yaml",
+ "thiserror",
  "time",
  "tokio",
  "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
-]
-
-[[package]]
-name = "tak-bench-test-support"
-version = "0.1.0"
-dependencies = [
- "tak-bench-core",
- "tokio",
 ]
 
 [[package]]
