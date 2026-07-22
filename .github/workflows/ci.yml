@@ -81,6 +81,27 @@ jobs:
       - name: Verify the crate package
         run: cargo package --locked
 
+  composite-action:
+    name: composite-action
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v6
+      - name: Build through the local action
+        id: tak-bench
+        uses: ./
+      - name: Verify action outputs
+        shell: bash
+        env:
+          TAK_BENCH_BIN: ${{ steps.tak-bench.outputs.binary-path }}
+          TAK_BENCH_VERSION: ${{ steps.tak-bench.outputs.version }}
+        run: |
+          set -euo pipefail
+          expected="$(cargo metadata --format-version 1 --no-deps --locked | jq -r '.packages[] | select(.name == "tak-bench") | .version')"
+          test -x "$TAK_BENCH_BIN"
+          test "$TAK_BENCH_VERSION" = "$expected"
+          test "$(tak-bench --version | awk '{print $2}')" = "$expected"
+
   audit:
     name: audit
     runs-on: ubuntu-24.04

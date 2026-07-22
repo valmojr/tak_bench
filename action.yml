@@ -1,0 +1,138 @@
+name: Setup or run TAK Bench
+description: Build a pinned TAK Bench revision and optionally run a server-neutral workload.
+
+inputs:
+  config:
+    description: Configuration YAML to execute. Leave empty when an external wrapper owns execution.
+    required: false
+    default: ""
+  report:
+    description: Sanitized JSON report path, relative to the caller workspace or absolute.
+    required: false
+    default: ""
+  subcommand:
+    description: Workload subcommand used when config is provided (run or smoke).
+    required: false
+    default: run
+  lifecycle-jsonl:
+    description: Emit sanitized lifecycle JSON Lines on stdout while running.
+    required: false
+    default: "true"
+
+outputs:
+  binary-path:
+    description: Absolute path to the binary built from the pinned action revision.
+    value: ${{ steps.prepare.outputs.binary-path }}
+  version:
+    description: Version reported by the built binary.
+    value: ${{ steps.prepare.outputs.version }}
+  report-path:
+    description: Absolute report path, or an empty string in setup-only mode.
+    value: ${{ steps.prepare.outputs.report-path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate action inputs
+      shell: bash
+      env:
+        INPUT_CONFIG: ${{ inputs.config }}
+        INPUT_LIFECYCLE_JSONL: ${{ inputs.lifecycle-jsonl }}
+        INPUT_REPORT: ${{ inputs.report }}
+        INPUT_SUBCOMMAND: ${{ inputs.subcommand }}
+      run: |
+        set -euo pipefail
+
+        case "$INPUT_SUBCOMMAND" in
+          run|smoke) ;;
+          *) echo 'subcommand must be run or smoke' >&2; exit 2 ;;
+        esac
+        case "$INPUT_LIFECYCLE_JSONL" in
+          true|false) ;;
+          *) echo 'lifecycle-jsonl must be true or false' >&2; exit 2 ;;
+        esac
+        if [[ -z "$INPUT_CONFIG" && -n "$INPUT_REPORT" ]]; then
+          echo 'report requires config; omit both for setup-only mode' >&2
+          exit 2
+        fi
+
+    - name: Install the supported Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: "1.88.0"
+
+    - name: Build the pinned TAK Bench revision
+      shell: bash
+      env:
+        ACTION_ROOT: ${{ github.action_path }}
+        ACTION_TARGET: ${{ runner.temp }}/tak-bench-action-target
+      run: |
+        set -euo pipefail
+        cargo build \
+          --manifest-path "$ACTION_ROOT/Cargo.toml" \
+          --bin tak-bench \
+          --release \
+          --locked \
+          --target-dir "$ACTION_TARGET"
+
+    - name: Export binary and report paths
+      id: prepare
+      shell: bash
+      env:
+        ACTION_TARGET: ${{ runner.temp }}/tak-bench-action-target
+        INPUT_CONFIG: ${{ inputs.config }}
+        INPUT_REPORT: ${{ inputs.report }}
+      run: |
+        set -euo pipefail
+
+        suffix=''
+        if [[ "${RUNNER_OS:-}" == 'Windows' ]]; then
+          suffix='.exe'
+        fi
+        binary="$ACTION_TARGET/release/tak-bench$suffix"
+        if [[ ! -x "$binary" ]]; then
+          echo 'built TAK Bench binary is unavailable' >&2
+          exit 1
+        fi
+
+        echo "$(dirname "$binary")" >> "$GITHUB_PATH"
+        echo "binary-path=$binary" >> "$GITHUB_OUTPUT"
+        echo "version=$("$binary" --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+        report=''
+        if [[ -n "$INPUT_CONFIG" ]]; then
+          report="$INPUT_REPORT"
+          if [[ -z "$report" ]]; then
+            report="$RUNNER_TEMP/tak-bench-report.json"
+          elif [[ "$report" != /* ]]; then
+            report="$GITHUB_WORKSPACE/$report"
+          fi
+          mkdir -p "$(dirname "$report")"
+        fi
+        echo "report-path=$report" >> "$GITHUB_OUTPUT"
+
+    - name: Run TAK Bench
+      if: inputs.config != ''
+      shell: bash
+      env:
+        TAK_BENCH_BIN: ${{ steps.prepare.outputs.binary-path }}
+        TAK_BENCH_CONFIG: ${{ inputs.config }}
+        TAK_BENCH_LIFECYCLE_JSONL: ${{ inputs.lifecycle-jsonl }}
+        TAK_BENCH_REPORT: ${{ steps.prepare.outputs.report-path }}
+        TAK_BENCH_SUBCOMMAND: ${{ inputs.subcommand }}
+      run: |
+        set -euo pipefail
+
+        arguments=(
+          "$TAK_BENCH_SUBCOMMAND"
+          --config "$TAK_BENCH_CONFIG"
+          --output "$TAK_BENCH_REPORT"
+        )
+        if [[ "$TAK_BENCH_LIFECYCLE_JSONL" == 'true' ]]; then
+          arguments+=(--lifecycle-jsonl)
+        fi
+        "$TAK_BENCH_BIN" "${arguments[@]}"
+
+branding:
+  icon: activity
+  color: blue
